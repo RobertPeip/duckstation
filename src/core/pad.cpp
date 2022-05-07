@@ -7,6 +7,7 @@
 #include "memory_card.h"
 #include "multitap.h"
 #include "system.h"
+#include "cpu_core.h"
 Log_SetChannel(Pad);
 
 Pad g_pad;
@@ -303,6 +304,9 @@ std::unique_ptr<MemoryCard> Pad::RemoveMemoryCard(u32 slot)
 
 u32 Pad::ReadRegister(u32 offset)
 {
+
+    u32 retval = UINT32_C(0xFFFFFFFF);
+
   switch (offset)
   {
     case 0x00: // JOY_DATA
@@ -315,9 +319,10 @@ u32 Pad::ReadRegister(u32 offset)
       m_receive_buffer_full = false;
       UpdateJoyStat();
 
-      return (ZeroExtend32(value) | (ZeroExtend32(value) << 8) | (ZeroExtend32(value) << 16) |
+      retval = (ZeroExtend32(value) | (ZeroExtend32(value) << 8) | (ZeroExtend32(value) << 16) |
               (ZeroExtend32(value) << 24));
     }
+    break;
 
     case 0x04: // JOY_STAT
     {
@@ -326,26 +331,35 @@ u32 Pad::ReadRegister(u32 offset)
 
       const u32 bits = m_JOY_STAT.bits;
       m_JOY_STAT.ACKINPUT = false;
-      return bits;
+      retval = bits;
     }
+    break;
 
     case 0x08: // JOY_MODE
-      return ZeroExtend32(m_JOY_MODE.bits);
+      retval = ZeroExtend32(m_JOY_MODE.bits);
+      break;
 
     case 0x0A: // JOY_CTRL
-      return ZeroExtend32(m_JOY_CTRL.bits);
+      retval = ZeroExtend32(m_JOY_CTRL.bits);
+      break;
 
     case 0x0E: // JOY_BAUD
-      return ZeroExtend32(m_JOY_BAUD);
+      retval = ZeroExtend32(m_JOY_BAUD);
+      break;
 
     default:
       Log_ErrorPrintf("Unknown register read: 0x%X", offset);
-      return UINT32_C(0xFFFFFFFF);
   }
+
+  CPU::tracer.PadOutCapture(offset, retval, 2);
+
+  return retval;
 }
 
 void Pad::WriteRegister(u32 offset, u32 value)
 {
+    CPU::tracer.PadOutCapture(offset, value, 1);
+
   switch (offset)
   {
     case 0x00: // JOY_DATA
@@ -441,8 +455,12 @@ void Pad::UpdateJoyStat()
 
 void Pad::TransferEvent(TickCount ticks_late)
 {
-  if (m_state == State::Transmitting)
-    DoTransfer(ticks_late);
+    if (m_state == State::Transmitting)
+    {
+        DoTransfer(ticks_late);
+
+        CPU::tracer.PadOutCapture(0, m_receive_buffer, 3);
+    }
   else
     DoACK();
 }
@@ -473,6 +491,8 @@ void Pad::BeginTransfer()
 
   m_state = State::Transmitting;
   m_transfer_event->SetPeriodAndSchedule(GetTransferTicks());
+
+  CPU::tracer.PadOutCapture(0, m_transmit_value, 5);
 }
 
 void Pad::DoTransfer(TickCount ticks_late)
@@ -562,6 +582,11 @@ void Pad::DoTransfer(TickCount ticks_late)
     break;
   }
 
+  if (device_index == 0)
+  {
+      CPU::tracer.PadOutCapture(data_out, data_in, 9);
+  }
+
   m_receive_buffer = data_in;
   m_receive_buffer_full = true;
 
@@ -595,6 +620,8 @@ void Pad::DoACK()
     Log_DebugPrintf("Triggering ACK interrupt");
     m_JOY_STAT.INTR = true;
     g_interrupt_controller.InterruptRequest(InterruptController::IRQ::IRQ7);
+
+    CPU::tracer.PadOutCapture(0, m_JOY_STAT.bits, 4);
   }
 
   EndTransfer();
@@ -615,6 +642,8 @@ void Pad::EndTransfer()
 
 void Pad::ResetDeviceTransferState()
 {
+  CPU::tracer.PadOutCapture(0, 0, 8);
+
   for (u32 i = 0; i < NUM_CONTROLLER_AND_CARD_PORTS; i++)
   {
     if (m_controllers[i])

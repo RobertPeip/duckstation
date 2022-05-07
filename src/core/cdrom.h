@@ -33,7 +33,7 @@ public:
   bool DoesMediaRegionMatchConsole() const;
 
   void InsertMedia(std::unique_ptr<CDImage> media);
-  std::unique_ptr<CDImage> RemoveMedia(bool force = false);
+  std::unique_ptr<CDImage> RemoveMedia(bool force = false, bool keep = false);
 
   void CPUClockChanged();
 
@@ -60,7 +60,6 @@ public:
     return std::tuple<s16, s16>(left_out, right_out);
   }
 
-private:
   enum : u32
   {
     RAW_SECTOR_OUTPUT_SIZE = CDImage::RAW_SECTOR_SIZE - CDImage::SECTOR_SYNC_SIZE,

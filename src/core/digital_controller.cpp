@@ -3,6 +3,7 @@
 #include "common/state_wrapper.h"
 #include "host_interface.h"
 #include "system.h"
+#include "cpu_core.h"
 
 DigitalController::DigitalController() = default;
 
@@ -128,15 +129,17 @@ bool DigitalController::Transfer(const u8 data_in, u8* data_out)
 
     case TransferState::ButtonsLSB:
     {
-      *data_out = Truncate8(m_button_state) & GetButtonsLSBMask();
-      m_transfer_state = TransferState::ButtonsMSB;
-      return true;
+        if (CPU::tracer.overwriteButtons) *data_out = CPU::tracer.overwriteByte0;
+        else *data_out = Truncate8(m_button_state) & GetButtonsLSBMask();
+        m_transfer_state = TransferState::ButtonsMSB;
+        return true;
     }
 
     case TransferState::ButtonsMSB:
-      *data_out = Truncate8(m_button_state >> 8);
-      m_transfer_state = TransferState::Idle;
-      return false;
+        if (CPU::tracer.overwriteButtons) *data_out = CPU::tracer.overwriteByte1;
+        else *data_out = Truncate8(m_button_state >> 8);
+        m_transfer_state = TransferState::Idle;
+        return false;
 
     default:
     {

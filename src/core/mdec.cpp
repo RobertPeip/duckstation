@@ -64,27 +64,37 @@ bool MDEC::DoState(StateWrapper& sw)
 
 u32 MDEC::ReadRegister(u32 offset)
 {
+    u32 retval;
+
   switch (offset)
   {
     case 0:
-      return ReadDataRegister();
+        retval = ReadDataRegister();
+        break;
 
     case 4:
     {
       Log_TracePrintf("MDEC status register -> 0x%08X", m_status.bits);
-      return m_status.bits;
+      retval = m_status.bits;
     }
+    break;
 
     default:
     {
       Log_ErrorPrintf("Unknown MDEC register read: 0x%08X", offset);
-      return UINT32_C(0xFFFFFFFF);
+      retval = UINT32_C(0xFFFFFFFF);
     }
   }
+
+  CPU::tracer.MDECOutCapture(7, offset, retval);
+
+  return retval;
 }
 
 void MDEC::WriteRegister(u32 offset, u32 value)
 {
+  CPU::tracer.MDECOutCapture(8, offset, value);
+
   switch (offset)
   {
     case 0:
@@ -117,6 +127,8 @@ void MDEC::WriteRegister(u32 offset, u32 value)
 
 void MDEC::DMARead(u32* words, u32 word_count)
 {
+  CPU::tracer.MDECOutCapture(9, 0, word_count);
+
   if (m_data_out_fifo.GetSize() < word_count)
   {
     Log_WarningPrintf("Insufficient data in output FIFO (requested %u, have %u)", word_count,
@@ -132,8 +144,8 @@ void MDEC::DMARead(u32* words, u32 word_count)
   }
 
   Log_DebugPrintf("DMA read complete, %u bytes left", m_data_out_fifo.GetSize() * sizeof(u32));
-  if (m_data_out_fifo.IsEmpty())
-    Execute();
+  //if (m_data_out_fifo.IsEmpty())
+  //  Execute();
 }
 
 void MDEC::DMAWrite(const u32* words, u32 word_count)
@@ -145,6 +157,7 @@ void MDEC::DMAWrite(const u32* words, u32 word_count)
 
   const u32 halfwords_to_write = std::min(word_count * 2, m_data_in_fifo.GetSpace() & ~u32(2));
   m_data_in_fifo.PushRange(reinterpret_cast<const u16*>(words), halfwords_to_write);
+
   Execute();
 }
 
@@ -186,6 +199,7 @@ void MDEC::UpdateStatus()
   m_status.current_block = (m_current_block + 4) % NUM_BLOCKS;
 
   // we always want data in if it's enabled
+  int a = m_data_in_fifo.GetSpace();
   const bool data_in_request = m_enable_dma_in && m_data_in_fifo.GetSpace() >= (32 * 2);
   m_status.data_in_request = data_in_request;
   g_dma.SetRequest(DMA::Channel::MDECin, data_in_request);
@@ -387,11 +401,20 @@ bool MDEC::DecodeMonoMacroblock()
 
   IDCT(m_blocks[0].data());
 
+#ifdef MDECFILEOUT
+    for (int i = 0; i < 64; i++)
+    {
+        CPU::tracer.MDECOutCapture(5, i, m_blocks[0][i]);
+    }
+#endif
+
   Log_DebugPrintf("Decoded mono macroblock, %u words remaining", m_remaining_halfwords / 2);
   ResetDecoder();
   m_state = State::WritingMacroblock;
 
   y_to_mono(m_blocks[0]);
+
+  CPU::tracer.MDECOutCapture(2, 0, s_ticks_per_block[static_cast<u8>(m_status.data_output_depth)] * 6);
 
   ScheduleBlockCopyOut(s_ticks_per_block[static_cast<u8>(m_status.data_output_depth)] * 6);
 
@@ -417,6 +440,16 @@ bool MDEC::DecodeColoredMacroblock()
   ResetDecoder();
   m_state = State::WritingMacroblock;
 
+#ifdef MDECFILEOUT
+  for (int b = 0; b < 6; b++)
+  {
+      for (int i = 0; i < 64; i++)
+      {
+          //CPU::tracer.MDECOutCapture(5, b * 64 + i, m_blocks[b][i]);
+      }
+  }
+#endif
+
   yuv_to_rgb(0, 0, m_blocks[0], m_blocks[1], m_blocks[2]);
   yuv_to_rgb(8, 0, m_blocks[0], m_blocks[1], m_blocks[3]);
   yuv_to_rgb(0, 8, m_blocks[0], m_blocks[1], m_blocks[4]);
@@ -424,6 +457,8 @@ bool MDEC::DecodeColoredMacroblock()
   m_total_blocks_decoded += 4;
 
   ScheduleBlockCopyOut(s_ticks_per_block[static_cast<u8>(m_status.data_output_depth)] * 6);
+
+  CPU::tracer.MDECOutCapture(2, 0, m_block_copy_out_event->m_downcount);
   return true;
 }
 
@@ -437,6 +472,8 @@ void MDEC::ScheduleBlockCopyOut(TickCount ticks)
 
 void MDEC::CopyOutBlock()
 {
+  CPU::tracer.MDECOutCapture(11, 0, 0);
+
   Assert(m_state == State::WritingMacroblock);
   m_block_copy_out_event->Deactivate();
 
@@ -597,6 +634,14 @@ bool MDEC::rl_decode_block(s16* blk, const u8* qt)
     m_current_coefficient += ((n >> 10) & 0x3F) + 1;
     if (m_current_coefficient >= 64)
     {
+#ifdef MDECFILEOUT
+        CPU::tracer.MDECOutCapture(3, m_current_block, m_current_coefficient);
+        CPU::tracer.MDECOutCapture(6, 0, m_data_in_fifo.GetSize());
+        for (int i = 0; i < 64; i++)
+        {
+            //CPU::tracer.MDECOutCapture(4, i, blk[i]);
+        }
+#endif
       m_current_coefficient = 64;
       return true;
     }
@@ -641,8 +686,10 @@ void MDEC::IDCT(s16* blk)
       for (u32 u = 0; u < 8; u++)
         sum += s64(temp_buffer[u + y * 8]) * s32(m_scale_table[u * 8 + x]);
 
-      blk[x + y * 8] =
-        static_cast<s16>(std::clamp<s32>(SignExtendN<9, s32>((sum >> 32) + ((sum >> 31) & 1)), -128, 127));
+      // s16 value = static_cast<s16>(std::clamp<s32>(SignExtendN<9, s32>((sum >> 32) + ((sum >> 31) & 1)), -128, 127));
+      s16 value = static_cast<s16>(std::clamp<s32>(SignExtendN<16, s32>((sum >> 32) + ((sum >> 31) & 1)), -128, 127));
+      blk[x + y * 8] = value;
+        
     }
   }
 }
@@ -674,6 +721,9 @@ void MDEC::yuv_to_rgb(u32 xx, u32 yy, const std::array<s16, 64>& Crblk, const st
       m_block_rgb[(x + xx) + ((y + yy) * 16)] = ZeroExtend32(static_cast<u16>(R)) |
                                                 (ZeroExtend32(static_cast<u16>(G)) << 8) |
                                                 (ZeroExtend32(static_cast<u16>(B)) << 16);
+
+      //CPU::tracer.MDECOutCapture(1, 0, m_block_rgb[(x + xx) + ((y + yy) * 16)]);
+      //CPU::tracer.debug_MDECOutTime[CPU::tracer.debug_MDECOutCount] = x | (xx << 8) | (y << 16) | (yy << 24);
     }
   }
 }
@@ -687,6 +737,8 @@ void MDEC::y_to_mono(const std::array<s16, 64>& Yblk)
     Y = std::clamp<s16>(Y, -128, 127);
     Y += 128;
     m_block_rgb[i] = static_cast<u32>(Y) & 0xFF;
+
+    CPU::tracer.MDECOutCapture(1, i, m_block_rgb[i]);
   }
 }
 

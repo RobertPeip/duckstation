@@ -9,6 +9,8 @@
 #include "settings.h"
 #include "spu.h"
 #include "system.h"
+#include "cpu_core.h"
+#include "bus.h"
 #include <cmath>
 #ifdef WITH_IMGUI
 #include "imgui.h"
@@ -359,15 +361,23 @@ void CDROM::InsertMedia(std::unique_ptr<CDImage> media)
   SetHoldPosition(0, true);
 }
 
-std::unique_ptr<CDImage> CDROM::RemoveMedia(bool force /* = false */)
+std::unique_ptr<CDImage> CDROM::RemoveMedia(bool force /* = false */, bool keep)
 {
   if (!HasMedia() && !force)
     return nullptr;
 
   const TickCount stop_ticks = GetTicksForStop(true);
 
-  Log_InfoPrintf("Removing CD...");
-  std::unique_ptr<CDImage> image = m_reader.RemoveMedia();
+  std::unique_ptr<CDImage> image;
+  if (!keep)
+  {
+      Log_InfoPrintf("Removing CD...");
+      std::unique_ptr<CDImage> image = m_reader.RemoveMedia();
+  }
+  else
+  {
+      m_data_fifo.Clear();
+  }
 
   m_last_sector_header_valid = false;
 
@@ -417,33 +427,40 @@ void CDROM::CPUClockChanged()
 
 u8 CDROM::ReadRegister(u32 offset)
 {
+    u8 retval = 0;
+
   switch (offset)
   {
     case 0: // status register
       Log_TracePrintf("CDROM read status register -> 0x%08X", m_status.bits);
-      return m_status.bits;
+      retval = m_status.bits;
+      break;
 
     case 1: // always response FIFO
     {
       if (m_response_fifo.IsEmpty())
       {
         Log_DevPrint("Response FIFO empty on read");
-        return 0x00;
+        retval = 0x00;
       }
-
-      const u8 value = m_response_fifo.Pop();
-      UpdateStatusRegister();
-      Log_DebugPrintf("CDROM read response FIFO -> 0x%08X", ZeroExtend32(value));
-      return value;
+      else
+      {
+          const u8 value = m_response_fifo.Pop();
+          UpdateStatusRegister();
+          Log_DebugPrintf("CDROM read response FIFO -> 0x%08X", ZeroExtend32(value));
+          retval = value;
+      }
     }
+    break;
 
     case 2: // always data FIFO
     {
       const u8 value = m_data_fifo.Pop();
       UpdateStatusRegister();
       Log_DebugPrintf("CDROM read data FIFO -> 0x%08X", ZeroExtend32(value));
-      return value;
+      retval = value;
     }
+    break;
 
     case 3:
     {
@@ -451,26 +468,34 @@ u8 CDROM::ReadRegister(u32 offset)
       {
         const u8 value = m_interrupt_flag_register | ~INTERRUPT_REGISTER_MASK;
         Log_DebugPrintf("CDROM read interrupt flag register -> 0x%02X", ZeroExtend32(value));
-        return value;
+        retval = value;
       }
       else
       {
         const u8 value = m_interrupt_enable_register | ~INTERRUPT_REGISTER_MASK;
         Log_DebugPrintf("CDROM read interrupt enable register -> 0x%02X", ZeroExtend32(value));
-        return value;
+        retval = value;
       }
     }
     break;
+
+    default:
+        Log_ErrorPrintf("Unknown CDROM register read: offset=0x%02X, index=%d", offset,
+            ZeroExtend32(m_status.index.GetValue()));
+        Panic("Unknown CDROM register");
+        retval = 0;
   }
 
-  Log_ErrorPrintf("Unknown CDROM register read: offset=0x%02X, index=%d", offset,
-                  ZeroExtend32(m_status.index.GetValue()));
-  Panic("Unknown CDROM register");
-  return 0;
+  CPU::tracer.CDOutCapture(8, offset, retval);
+
+  return retval;
+
 }
 
 void CDROM::WriteRegister(u32 offset, u8 value)
 {
+  CPU::tracer.CDOutCapture(9, offset, value);
+
   if (offset == 0)
   {
     Log_TracePrintf("CDROM status register <- 0x%02X", value);
@@ -627,6 +652,8 @@ void CDROM::WriteRegister(u32 offset, u8 value)
 
 void CDROM::DMARead(u32* words, u32 word_count)
 {
+  CPU::tracer.CDOutCapture(10, 0, word_count);
+
   const u32 words_in_fifo = m_data_fifo.GetSize() / 4;
   if (words_in_fifo < word_count)
   {
@@ -636,6 +663,7 @@ void CDROM::DMARead(u32* words, u32 word_count)
 
   const u32 bytes_to_read = std::min<u32>(word_count * sizeof(u32), m_data_fifo.GetSize());
   m_data_fifo.PopRange(reinterpret_cast<u8*>(words), bytes_to_read);
+  UpdateStatusRegister();
 }
 
 void CDROM::SetInterrupt(Interrupt interrupt)
@@ -674,8 +702,13 @@ void CDROM::DeliverAsyncInterrupt()
   if (m_pending_async_interrupt == static_cast<u8>(Interrupt::DataReady))
     m_current_read_sector_buffer = m_current_write_sector_buffer;
 
+  u8 value = m_async_response_fifo.Peek();
+
   m_response_fifo.Clear();
   m_response_fifo.PushFromQueue(&m_async_response_fifo);
+
+  CPU::tracer.CDOutCapture(4, value, m_response_fifo.GetSize());
+
   m_interrupt_flag_register = m_pending_async_interrupt;
   m_pending_async_interrupt = 0;
   UpdateInterruptRequest();
@@ -687,6 +720,8 @@ void CDROM::SendACKAndStat()
 {
   m_response_fifo.Push(m_secondary_status.bits);
   SetInterrupt(Interrupt::ACK);
+
+  CPU::tracer.CDOutCapture(3, m_secondary_status.bits, m_response_fifo.GetSize());
 }
 
 void CDROM::SendErrorResponse(u8 stat_bits /* = STAT_ERROR */, u8 reason /* = 0x80 */)
@@ -694,12 +729,17 @@ void CDROM::SendErrorResponse(u8 stat_bits /* = STAT_ERROR */, u8 reason /* = 0x
   m_response_fifo.Push(m_secondary_status.bits | stat_bits);
   m_response_fifo.Push(reason);
   SetInterrupt(Interrupt::Error);
+
+  CPU::tracer.CDOutCapture(5, 0, m_secondary_status.bits | (stat_bits << 8) | (reason << 16));
 }
 
 void CDROM::SendAsyncErrorResponse(u8 stat_bits /* = STAT_ERROR */, u8 reason /* = 0x80 */)
 {
   m_async_response_fifo.Push(m_secondary_status.bits | stat_bits);
   m_async_response_fifo.Push(reason);
+
+  CPU::tracer.CDOutCapture(5, 0, m_secondary_status.bits | (stat_bits << 8) | (reason << 16));
+
   SetAsyncInterrupt(Interrupt::Error);
 }
 
@@ -796,31 +836,31 @@ TickCount CDROM::GetTicksForSeek(CDImage::LBA new_lba, bool ignore_speed_change)
       ClearDriveState();
   }
 
-  if (lba_diff < 32)
+  if (lba_diff < 32)  
   {
-    ticks += ticks_per_sector * std::min<u32>(5u, lba_diff);
+    ticks += ticks_per_sector * std::min<u32>(5u, lba_diff); // up to 1128960 or 2257920
   }
   else
   {
     // This is a still not a very accurate model, but it's roughly in line with the behavior of hardware tests.
-    const float disc_distance = 0.2323384936f * std::log(static_cast<float>((new_lba / 4500) + 1u));
+    const float disc_distance = 0.2323384936f * std::log(static_cast<float>((new_lba / 4500) + 1u)); // about 0.0-1.0
 
     float seconds;
     if (lba_diff <= CDImage::FRAMES_PER_SECOND)
     {
-      // 30ms + (diff * 30ms) + (disc distance * 30ms)
+      // 30ms + (diff * 30ms) + (disc distance * 30ms) => 1449584 - 2032128(new_lba 0) / 3060619 (new_lba 350000)
       seconds = 0.03f + ((static_cast<float>(lba_diff) / static_cast<float>(CDImage::FRAMES_PER_SECOND)) * 0.03f) +
                 (disc_distance * 0.03f);
     }
     else if (lba_diff <= CDImage::FRAMES_PER_MINUTE)
     {
-      // 150ms + (diff * 30ms) + (disc distance * 50ms)
+      // 150ms + (diff * 30ms) + (disc distance * 50ms) => 5097480 - 6096384(new_lba 0)  / 7810537 (new_lba 350000)
       seconds = 0.15f + ((static_cast<float>(lba_diff) / static_cast<float>(CDImage::FRAMES_PER_MINUTE)) * 0.03f) +
                 (disc_distance * 0.05f);
     }
     else
     {
-      // 200ms + (diff * 500ms)
+      // 200ms + (diff * 500ms) => 6961962 - 21408428
       seconds = 0.2f + ((static_cast<float>(lba_diff) / static_cast<float>(72 * CDImage::FRAMES_PER_MINUTE)) * 0.4f);
     }
 
@@ -879,6 +919,8 @@ CDImage::LBA CDROM::GetNextSectorToBeRead()
 
 void CDROM::BeginCommand(Command command)
 {
+  CPU::tracer.CDOutCapture(1, (u8)command & 0xFF, 0);
+
   TickCount ack_delay = GetAckDelayForCommand(command);
 
   if (HasPendingCommand())
@@ -1170,7 +1212,9 @@ void CDROM::ExecuteCommand(TickCount ticks_late)
 
     case Command::Play:
     {
-      const u8 track = m_param_fifo.IsEmpty() ? 0 : PackedBCDToBinary(m_param_fifo.Peek(0));
+      u8 track = m_param_fifo.IsEmpty() ? 0 : PackedBCDToBinary(m_param_fifo.Peek(0));
+
+      //track = 4; // debug testing!
       Log_DebugPrintf("CDROM play command, track=%u", track);
 
       if (!CanReadMedia())
@@ -1405,6 +1449,7 @@ void CDROM::ExecuteCommand(TickCount ticks_late)
         m_response_fifo.Push(m_last_subq.absolute_minute_bcd);
         m_response_fifo.Push(m_last_subq.absolute_second_bcd);
         m_response_fifo.Push(m_last_subq.absolute_frame_bcd);
+        CPU::tracer.CDOutCapture(3, m_last_subq.absolute_frame_bcd, m_response_fifo.GetSize());
         SetInterrupt(Interrupt::ACK);
       }
 
@@ -1425,6 +1470,7 @@ void CDROM::ExecuteCommand(TickCount ticks_late)
         m_response_fifo.Push(m_secondary_status.bits);
         m_response_fifo.Push(BinaryToBCD(Truncate8(m_reader.GetMedia()->GetFirstTrackNumber())));
         m_response_fifo.Push(BinaryToBCD(Truncate8(m_reader.GetMedia()->GetLastTrackNumber())));
+        CPU::tracer.CDOutCapture(3, BinaryToBCD(Truncate8(m_reader.GetMedia()->GetLastTrackNumber())), m_response_fifo.GetSize());
         SetInterrupt(Interrupt::ACK);
       }
       else
@@ -1441,6 +1487,7 @@ void CDROM::ExecuteCommand(TickCount ticks_late)
       Log_DebugPrintf("CDROM GetTD command");
       Assert(m_param_fifo.GetSize() >= 1);
       const u8 track = PackedBCDToBinary(m_param_fifo.Peek());
+      u8 count = m_reader.GetMedia()->GetTrackCount();
 
       if (!CanReadMedia())
       {
@@ -1462,7 +1509,7 @@ void CDROM::ExecuteCommand(TickCount ticks_late)
         m_response_fifo.Push(BinaryToBCD(Truncate8(pos.minute)));
         m_response_fifo.Push(BinaryToBCD(Truncate8(pos.second)));
         Log_DevPrintf("GetTD %u -> %u %u", track, pos.minute, pos.second);
-
+        CPU::tracer.CDOutCapture(3, track, m_response_fifo.GetSize());
         SetInterrupt(Interrupt::ACK);
       }
 
@@ -1525,6 +1572,7 @@ void CDROM::ExecuteTestCommand(u8 subcommand)
       Log_DebugPrintf("Reset SCEx counters");
       m_secondary_status.motor_on = true;
       m_response_fifo.Push(m_secondary_status.bits);
+      CPU::tracer.CDOutCapture(3, m_secondary_status.bits, m_response_fifo.GetSize());
       SetInterrupt(Interrupt::ACK);
       EndCommand();
       return;
@@ -1536,6 +1584,7 @@ void CDROM::ExecuteTestCommand(u8 subcommand)
       m_response_fifo.Push(m_secondary_status.bits);
       m_response_fifo.Push(0); // # of TOC reads?
       m_response_fifo.Push(0); // # of SCEx strings received
+      CPU::tracer.CDOutCapture(3, 0, m_response_fifo.GetSize());
       SetInterrupt(Interrupt::ACK);
       EndCommand();
       return;
@@ -1547,6 +1596,7 @@ void CDROM::ExecuteTestCommand(u8 subcommand)
 
       static constexpr u8 response[] = {0x95, 0x05, 0x16, 0xC1};
       m_response_fifo.PushRange(response, countof(response));
+      CPU::tracer.CDOutCapture(3, 0xC1, m_response_fifo.GetSize());
       SetInterrupt(Interrupt::ACK);
       EndCommand();
       return;
@@ -1580,6 +1630,7 @@ void CDROM::ExecuteTestCommand(u8 subcommand)
         }
         break;
       }
+      CPU::tracer.CDOutCapture(3, 'e', m_response_fifo.GetSize());
 
       SetInterrupt(Interrupt::ACK);
       EndCommand();
@@ -1746,8 +1797,13 @@ void CDROM::BeginReading(TickCount ticks_late /* = 0 */, bool after_seek /* = fa
 
   Log_DebugPrintf("Starting reading @ LBA %u", m_current_lba);
 
+#ifdef FASTCD
+  const TickCount ticks = 10000;
+  const TickCount first_sector_ticks = 10000;
+#else
   const TickCount ticks = GetTicksForRead();
   const TickCount first_sector_ticks = ticks + (after_seek ? 0 : GetTicksForSeek(m_current_lba)) - ticks_late;
+#endif
 
   m_secondary_status.ClearActiveBits();
   m_secondary_status.motor_on = true;
@@ -1768,6 +1824,8 @@ void CDROM::BeginPlaying(u8 track, TickCount ticks_late /* = 0 */, bool after_se
   m_last_cdda_report_frame_nibble = 0xFF;
   m_play_track_number_bcd = track;
   m_fast_forward_rate = 0;
+
+  //m_fast_forward_rate = -4; // debug testing!
 
   // if track zero, start from current position
   if (track != 0)
@@ -1855,6 +1913,7 @@ void CDROM::UpdatePositionWhileSeeking()
   }
   else if (m_seek_end_lba < m_seek_start_lba)
   {
+      float test = static_cast<float>(m_seek_start_lba - m_seek_end_lba) * completed_frac;
     current_lba =
       m_seek_start_lba -
       std::max<CDImage::LBA>(
@@ -2234,6 +2293,7 @@ void CDROM::DoSectorRead()
   }
 
   const bool is_data_sector = subq.IsData();
+  //m_mode.auto_pause = false; debug testing!
   if (!is_data_sector)
   {
     if (m_play_track_number_bcd == 0)
@@ -2248,6 +2308,10 @@ void CDROM::DoSectorRead()
       Log_DevPrintf("Auto pause at the start of track %02x (LBA %u)", m_last_subq.track_number_bcd, m_current_lba);
       StopReadingWithDataEnd();
       return;
+    }
+    else if (subq.track_number_bcd != m_play_track_number_bcd)
+    {
+        int a = 5;
     }
   }
   else
@@ -2341,6 +2405,8 @@ void CDROM::ProcessDataSector(const u8* raw_sector, const CDImage::SubChannelQ& 
 
   m_current_write_sector_buffer = sb_num;
 
+  CPU::tracer.CDOutCapture(7, sb->size & 0xFF, m_current_write_sector_buffer);
+
   // Deliver to CPU
   if (HasPendingAsyncInterrupt())
   {
@@ -2385,8 +2451,15 @@ static std::array<std::array<s16, 29>, 7> s_zigzag_table = {
 static s16 ZigZagInterpolate(const s16* ringbuf, const s16* table, u8 p)
 {
   s32 sum = 0;
+  s16 bufvalues[29];
+  s16 zigvalues[29];
+
   for (u8 i = 0; i < 29; i++)
-    sum += (s32(ringbuf[(p - i) & 0x1F]) * s32(table[i])) / 0x8000;
+  {
+      bufvalues[i] = ringbuf[(p - i) & 0x1F];
+      zigvalues[i] = table[i];
+      sum += (s32(ringbuf[(p - i) & 0x1F]) * s32(table[i])) / 0x8000;
+  }
 
   return static_cast<s16>(std::clamp<s32>(sum, -0x8000, 0x7FFF));
 }
@@ -2396,17 +2469,20 @@ void CDROM::ResampleXAADPCM(const s16* frames_in, u32 num_frames_in)
 {
   // Since the disc reads and SPU are running at different speeds, we might be _slightly_ behind, which is fine, since
   // the SPU will over-read in the next batch to catch up.
-  if (m_audio_fifo.GetSize() > AUDIO_FIFO_LOW_WATERMARK)
-  {
-    Log_DevPrintf("Dropping %u XA frames because audio FIFO still has %u frames", num_frames_in,
-                  m_audio_fifo.GetSize());
-    return;
-  }
+  //if (m_audio_fifo.GetSize() > AUDIO_FIFO_LOW_WATERMARK)
+  //{
+  //  Log_DevPrintf("Dropping %u XA frames because audio FIFO still has %u frames", num_frames_in,
+  //                m_audio_fifo.GetSize());
+  //  //return;
+  //}
 
   s16* left_ringbuf = m_xa_resample_ring_buffer[0].data();
   s16* right_ringbuf = m_xa_resample_ring_buffer[1].data();
   u8 p = m_xa_resample_p;
   u8 sixstep = m_xa_resample_sixstep;
+
+  s16 ringbuf[32][2];
+
   for (u32 in_sample_index = 0; in_sample_index < num_frames_in; in_sample_index++)
   {
     const s16 left = *(frames_in++);
@@ -2422,6 +2498,10 @@ void CDROM::ResampleXAADPCM(const s16* frames_in, u32 num_frames_in)
       left_ringbuf[p] = left;
       if constexpr (STEREO)
         right_ringbuf[p] = right;
+
+      ringbuf[p][0] = left;
+      ringbuf[p][1] = right;
+
       p = (p + 1) % 32;
       sixstep--;
 
@@ -2432,7 +2512,9 @@ void CDROM::ResampleXAADPCM(const s16* frames_in, u32 num_frames_in)
         {
           const s16 left_interp = ZigZagInterpolate(left_ringbuf, s_zigzag_table[j].data(), p);
           const s16 right_interp = STEREO ? ZigZagInterpolate(right_ringbuf, s_zigzag_table[j].data(), p) : left_interp;
-          AddCDAudioFrame(left_interp, right_interp);
+          CPU::tracer.XAOutCapture(4, left_interp | (right_interp << 16));
+          if (m_audio_fifo.GetSize() < 80000)
+            AddCDAudioFrame(left_interp, right_interp);
         }
       }
     }
@@ -2503,6 +2585,12 @@ void CDROM::ProcessXAADPCMSector(const u8* raw_sector, const CDImage::SubChannel
     return;
   }
 
+  // debug tests
+  //m_last_sector_subheader.codinginfo.mono_stereo = 1;
+  //m_last_sector_subheader.codinginfo.bits_per_sample = 0;
+  //m_last_sector_subheader.codinginfo.sample_rate = false;
+  //m_last_sector_subheader.submode.eof = false;
+
   // Reset current file on EOF, and play the file in the next sector.
   if (m_last_sector_subheader.submode.eof)
     ResetCurrentXAFile();
@@ -2538,23 +2626,23 @@ static s16 GetPeakVolume(const u8* raw_sector, u8 channel)
 {
   static constexpr u32 NUM_SAMPLES = CDImage::RAW_SECTOR_SIZE / sizeof(s16);
 
-#if defined(CPU_X64)
-  static_assert(Common::IsAlignedPow2(NUM_SAMPLES, 8));
-  const u8* current_ptr = raw_sector;
-  __m128i v_peak = _mm_set1_epi16(0);
-  for (u32 i = 0; i < NUM_SAMPLES; i += 8)
-  {
-    __m128i val = _mm_loadu_si128(reinterpret_cast<const __m128i*>(current_ptr));
-    v_peak = _mm_max_epi16(val, v_peak);
-    current_ptr += 16;
-  }
-  s16 v_peaks[8];
-  _mm_store_si128(reinterpret_cast<__m128i*>(v_peaks), v_peak);
-  if (channel == 0)
-    return std::max(v_peaks[0], std::max(v_peaks[2], std::max(v_peaks[4], v_peaks[6])));
-  else
-    return std::max(v_peaks[1], std::max(v_peaks[3], std::max(v_peaks[5], v_peaks[7])));
-#else
+#//if defined(CPU_X64)
+ // static_assert(Common::IsAlignedPow2(NUM_SAMPLES, 8));
+ // const u8* current_ptr = raw_sector;
+ // __m128i v_peak = _mm_set1_epi16(0);
+ // for (u32 i = 0; i < NUM_SAMPLES; i += 8)
+ // {
+ //   __m128i val = _mm_loadu_si128(reinterpret_cast<const __m128i*>(current_ptr));
+ //   v_peak = _mm_max_epi16(val, v_peak);
+ //   current_ptr += 16;
+ // }
+ // s16 v_peaks[8];
+ // _mm_store_si128(reinterpret_cast<__m128i*>(v_peaks), v_peak);
+ // if (channel == 0)
+ //   return std::max(v_peaks[0], std::max(v_peaks[2], std::max(v_peaks[4], v_peaks[6])));
+ // else
+ //   return std::max(v_peaks[1], std::max(v_peaks[3], std::max(v_peaks[5], v_peaks[7])));
+#//else
   const u8* current_ptr = raw_sector + (channel * sizeof(s16));
   s16 peak = 0;
 
@@ -2567,7 +2655,7 @@ static s16 GetPeakVolume(const u8* raw_sector, u8 channel)
   }
 
   return peak;
-#endif
+//#endif
 }
 
 void CDROM::ProcessCDDASector(const u8* raw_sector, const CDImage::SubChannelQ& subq)
@@ -2638,6 +2726,7 @@ void CDROM::ProcessCDDASector(const u8* raw_sector, const CDImage::SubChannelQ& 
     std::memcpy(&samp_left, sector_ptr, sizeof(samp_left));
     std::memcpy(&samp_right, sector_ptr + sizeof(s16), sizeof(samp_right));
     sector_ptr += sizeof(s16) * 2;
+    CPU::tracer.CDOutCapture(11, i, (u16)samp_left | (((u32)((u16)samp_right)) << 16));
     AddCDAudioFrame(samp_left, samp_right);
   }
 }
@@ -2656,10 +2745,24 @@ void CDROM::LoadDataFIFO()
   {
     Log_WarningPrintf("Attempting to load empty sector buffer");
     m_data_fifo.PushRange(sb.data.data(), RAW_SECTOR_OUTPUT_SIZE);
+
+#ifdef CDFILEOUT
+    for (int i = 0; i < RAW_SECTOR_OUTPUT_SIZE; i += 4)
+    {
+        CPU::tracer.CDOutCapture(2, i, m_data_fifo.Peek(i) | (m_data_fifo.Peek(i + 1) << 8) | (m_data_fifo.Peek(i + 2) << 16) | (m_data_fifo.Peek(i + 3) << 24));
+    }
+#endif
   }
   else
   {
     m_data_fifo.PushRange(sb.data.data(), sb.size);
+
+#ifdef CDFILEOUT
+    for (int i = 0; i < sb.size; i += 4)
+    {
+        CPU::tracer.CDOutCapture(2, i, m_data_fifo.Peek(i) | (m_data_fifo.Peek(i + 1) << 8) | (m_data_fifo.Peek(i + 2) << 16) | (m_data_fifo.Peek(i + 3) << 24));
+    }
+#endif
     sb.size = 0;
   }
 

@@ -260,6 +260,15 @@ void RecalculateMemoryTimings()
   std::tie(m_spu_access_time[0], m_spu_access_time[1], m_spu_access_time[2]) =
     CalculateMemoryTiming(m_MEMCTRL.spu_delay_size, m_MEMCTRL.common_delay);
 
+  m_exp1_access_time[0] = 1;
+  m_exp1_access_time[1] = 1;
+  m_exp1_access_time[2] = 1;
+
+  m_exp2_access_time[0] = 1;
+  m_exp2_access_time[1] = 1;
+  m_exp2_access_time[2] = 1;
+
+
   Log_TracePrintf("BIOS Memory Timing: %u bit bus, byte=%d, halfword=%d, word=%d",
                   m_MEMCTRL.bios_delay_size.data_bus_16bit ? 16 : 8, m_bios_access_time[0] + 1,
                   m_bios_access_time[1] + 1, m_bios_access_time[2] + 1);
@@ -918,15 +927,11 @@ static TickCount DoEXP2Access(u32 offset, u32& value)
       }
       else if (value == '\n')
       {
-        if (!m_tty_line_buffer.empty())
-        {
-          Log_InfoPrintf("TTY: %s", m_tty_line_buffer.c_str());
-#ifdef _DEBUG
-          if (CPU::IsTraceEnabled())
-            CPU::WriteToExecutionLog("TTY: %s\n", m_tty_line_buffer.c_str());
-#endif
-        }
-        m_tty_line_buffer.clear();
+          FILE* file = fopen("R:\\debug_duck_tty.txt", "a");
+          fputs(m_tty_line_buffer.c_str(), file);
+          fputc('\n', file);
+          fclose(file);
+          m_tty_line_buffer.clear();
       }
       else
       {
@@ -1292,17 +1297,30 @@ ALWAYS_INLINE_RELEASE bool DoInstructionRead(PhysicalMemoryAddress address, void
   if (address < RAM_MIRROR_END)
   {
     std::memcpy(data, &g_ram[address & g_ram_mask], sizeof(u32) * word_count);
+#ifdef FIXMEMTIME 
     if constexpr (add_ticks)
-      g_state.pending_ticks += (icache_read ? 1 : RAM_READ_TICKS) * word_count;
+        g_state.pending_ticks += FIXEDMEMTIME;
+#else
+    #ifndef NOMEMTIME
+        if constexpr (add_ticks)
+          g_state.pending_ticks += (icache_read ? 2 : RAM_READ_TICKS) * word_count;
+    #endif
+#endif
 
     return true;
   }
   else if (address >= BIOS_BASE && address < (BIOS_BASE + BIOS_SIZE))
   {
     std::memcpy(data, &g_bios[(address - BIOS_BASE) & BIOS_MASK], sizeof(u32) * word_count);
+#ifdef FIXMEMTIME 
     if constexpr (add_ticks)
-      g_state.pending_ticks += m_bios_access_time[static_cast<u32>(MemoryAccessSize::Word)] * word_count;
-
+        g_state.pending_ticks += FIXEDMEMTIME;
+#else
+    #ifndef NOMEMTIME
+        if constexpr (add_ticks)
+          g_state.pending_ticks += m_bios_access_time[static_cast<u32>(MemoryAccessSize::Word)] * word_count;
+    #endif
+#endif
     return true;
   }
   else
@@ -1386,26 +1404,26 @@ u32 FillICache(VirtualMemoryAddress address)
   const u32 line = GetICacheLine(address);
   u8* line_data = &g_state.icache_data[line * ICACHE_LINE_SIZE];
   u32 line_tag;
-  switch ((address >> 2) & 0x03u)
-  {
-    case 0:
+  //switch ((address >> 2) & 0x03u)
+  //{
+  //  case 0:
       DoInstructionRead<true, true, 4, false>(address & ~(ICACHE_LINE_SIZE - 1u), line_data);
       line_tag = GetICacheTagForAddress(address);
-      break;
-    case 1:
-      DoInstructionRead<true, true, 3, false>(address & (~(ICACHE_LINE_SIZE - 1u) | 0x4), line_data + 0x4);
-      line_tag = GetICacheTagForAddress(address) | 0x1;
-      break;
-    case 2:
-      DoInstructionRead<true, true, 2, false>(address & (~(ICACHE_LINE_SIZE - 1u) | 0x8), line_data + 0x8);
-      line_tag = GetICacheTagForAddress(address) | 0x3;
-      break;
-    case 3:
-    default:
-      DoInstructionRead<true, true, 1, false>(address & (~(ICACHE_LINE_SIZE - 1u) | 0xC), line_data + 0xC);
-      line_tag = GetICacheTagForAddress(address) | 0x7;
-      break;
-  }
+ //     break;
+ //   case 1:
+ //     DoInstructionRead<true, true, 3, false>(address & (~(ICACHE_LINE_SIZE - 1u) | 0x4), line_data + 0x4);
+ //     line_tag = GetICacheTagForAddress(address) | 0x1;
+ //     break;
+ //   case 2:
+ //     DoInstructionRead<true, true, 2, false>(address & (~(ICACHE_LINE_SIZE - 1u) | 0x8), line_data + 0x8);
+ //     line_tag = GetICacheTagForAddress(address) | 0x3;
+ //     break;
+ //   case 3:
+ //   default:
+ //     DoInstructionRead<true, true, 1, false>(address & (~(ICACHE_LINE_SIZE - 1u) | 0xC), line_data + 0xC);
+ //     line_tag = GetICacheTagForAddress(address) | 0x7;
+ //     break;
+ // }
   g_state.icache_tags[line] = line_tag;
 
   const u32 offset = GetICacheLineOffset(address);
@@ -1674,8 +1692,13 @@ bool FetchInstruction()
 #if 0
       DoInstructionRead<true, false, 1, false>(address, &g_state.next_instruction.bits);
 #else
-      if (CompareICacheTag(address))
-        g_state.next_instruction.bits = ReadICache(address);
+        if (CompareICacheTag(address))
+        {
+            g_state.next_instruction.bits = ReadICache(address);
+#ifdef FIXMEMTIME 
+            g_state.pending_ticks += FIXEDMEMTIME;
+#endif
+        }
       else
         g_state.next_instruction.bits = FillICache(address);
 #endif
@@ -1781,8 +1804,12 @@ bool ReadMemoryByte(VirtualMemoryAddress addr, u8* value)
     return false;
   }
 
+#if defined(NOMEMTIME) || defined(NOMEMREADTIME)
+  return true;
+#else
   g_state.pending_ticks += cycles;
   return true;
+#endif
 }
 
 bool ReadMemoryHalfWord(VirtualMemoryAddress addr, u16* value)
@@ -1799,8 +1826,12 @@ bool ReadMemoryHalfWord(VirtualMemoryAddress addr, u16* value)
     return false;
   }
 
+#if defined(NOMEMTIME) || defined(NOMEMREADTIME)
+  return true;
+#else
   g_state.pending_ticks += cycles;
   return true;
+#endif
 }
 
 bool ReadMemoryWord(VirtualMemoryAddress addr, u32* value)
@@ -1815,8 +1846,12 @@ bool ReadMemoryWord(VirtualMemoryAddress addr, u32* value)
     return false;
   }
 
+#if defined(NOMEMTIME) || defined(NOMEMREADTIME)
+  return true;
+#else
   g_state.pending_ticks += cycles;
   return true;
+#endif
 }
 
 bool WriteMemoryByte(VirtualMemoryAddress addr, u32 value)

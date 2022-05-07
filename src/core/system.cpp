@@ -1124,6 +1124,7 @@ void Reset()
   g_gpu->RestoreGraphicsAPIState();
 
   CPU::Reset();
+  CPU::g_state.pending_ticks = 0;
   CPU::CodeCache::Flush();
   if (g_settings.gpu_pgxp_enable)
     PGXP::Initialize();
@@ -1201,7 +1202,12 @@ bool DoLoadState(ByteStream* state, bool force_software_renderer, bool update_di
     }
     else
     {
-      media = OpenCDImage(media_filename.c_str(), &error, false, ShouldCheckForImagePatches());
+        const char* path = media_filename.c_str();
+
+        //path = "C:\\Projekte\\psx\\games\\tod2\\Tales of Destiny II (USA) (Disc 1).cue";
+        //path = "C:\\Projekte\\psx\\games\\Rayman\\Rayman (USA)_music.cue";
+
+      media = OpenCDImage(path, &error, false, ShouldCheckForImagePatches());
       if (!media)
       {
         if (old_media)
@@ -1443,7 +1449,7 @@ void DoRunFrame()
   }
 
   // Generate any pending samples from the SPU before sleeping, this way we reduce the chances of underruns.
-  g_spu.GeneratePendingSamples();
+  //g_spu.GeneratePendingSamples();
 
   if (s_cheat_list)
     s_cheat_list->Apply();
@@ -2095,6 +2101,8 @@ bool CheckForSBIFile(CDImage* image)
   {
     return true;
   }
+
+  //return true;
 
   Log_WarningPrintf("SBI file missing but required for %s (%s)", s_running_game_code.c_str(),
                     s_running_game_title.c_str());

@@ -1,4 +1,5 @@
 #include "cd_xa.h"
+#include "../core/cpu_core.h"
 #include "cd_image.h"
 #include <algorithm>
 #include <array>
@@ -50,6 +51,8 @@ static void DecodeXA_ADPCMChunk(const u8* chunk_ptr, s16* samples, s32* last_sam
 
       *out_samples_ptr = static_cast<s16>(std::clamp<s32>(interp_sample, -0x8000, 0x7FFF));
       out_samples_ptr += out_samples_increment;
+
+      CPU::tracer.XAOutCapture(2, static_cast<s16>(std::clamp<s32>(interp_sample, -0x8000, 0x7FFF)));
     }
   }
 }
@@ -62,16 +65,38 @@ static void DecodeXA_ADPCMChunks(const u8* chunk_ptr, s16* samples, s32* last_sa
   constexpr u32 WORDS_PER_CHUNK = 28;
   constexpr u32 SAMPLES_PER_CHUNK = WORDS_PER_CHUNK * (IS_8BIT ? 4 : 8);
 
+  s16* samplesStart = samples;
+
   for (u32 i = 0; i < NUM_CHUNKS; i++)
   {
     DecodeXA_ADPCMChunk<IS_STEREO, IS_8BIT>(chunk_ptr, samples, last_samples);
     samples += SAMPLES_PER_CHUNK;
     chunk_ptr += CHUNK_SIZE_IN_BYTES;
   }
+
+  int count = SAMPLES_PER_CHUNK * NUM_CHUNKS;
+  if (IS_STEREO) count /= 2;
+  for (int i = 0; i < count; i++)
+  {
+      if (IS_STEREO)
+      {
+          CPU::tracer.XAOutCapture(3, samplesStart[i * 2] | (samplesStart[i * 2 + 1] << 16));
+      }
+      else
+      {
+          CPU::tracer.XAOutCapture(3, samplesStart[i]);
+      }
+  }
 }
 
 void DecodeADPCMSector(const void* data, s16* samples, s32* last_samples)
 {
+    const u8* chunk_bytes = reinterpret_cast<const u8*>(data);
+    for (int i = 0; i < 588; i++)
+    {
+        CPU::tracer.XAOutCapture(1, *(unsigned int*)&chunk_bytes[i * 4]);
+    }
+
   const XASubHeader* subheader = reinterpret_cast<const XASubHeader*>(
     reinterpret_cast<const u8*>(data) + CDImage::SECTOR_SYNC_SIZE + sizeof(CDImage::SectorHeader));
 

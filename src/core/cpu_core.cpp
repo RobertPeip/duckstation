@@ -13,7 +13,17 @@
 #include "settings.h"
 #include "system.h"
 #include "timing_event.h"
+#include "timers.h"
+#include "interrupt_controller.h"
+#include "gpu_sw_backend.h"
+#include "gpu.h"
+#include "dma.h"
+#include "pad.h"
+#include "mdec.h"
+#include "cdrom.h"
+#include "spu.h"
 #include <cstdio>
+#include <fstream>
 
 Log_SetChannel(CPU::Core);
 
@@ -22,7 +32,7 @@ namespace CPU {
 static void SetPC(u32 new_pc);
 static void UpdateLoadDelay();
 static void Branch(u32 target);
-static void FlushPipeline();
+static void FlushPipeline(bool isException);
 
 State g_state;
 bool g_using_interpreter = false;
@@ -198,7 +208,7 @@ ALWAYS_INLINE_RELEASE void SetPC(u32 new_pc)
 {
   DebugAssert(Common::IsAlignedPow2(new_pc, 4));
   g_state.regs.npc = new_pc;
-  FlushPipeline();
+  FlushPipeline(false);
 }
 
 ALWAYS_INLINE_RELEASE void Branch(u32 target)
@@ -227,25 +237,6 @@ ALWAYS_INLINE_RELEASE static void RaiseException(u32 CAUSE_bits, u32 EPC, u32 ve
   g_state.cop0_regs.cause.bits = (g_state.cop0_regs.cause.bits & ~Cop0Registers::CAUSE::EXCEPTION_WRITE_MASK) |
                                  (CAUSE_bits & Cop0Registers::CAUSE::EXCEPTION_WRITE_MASK);
 
-#ifdef _DEBUG
-  if (g_state.cop0_regs.cause.Excode != Exception::INT && g_state.cop0_regs.cause.Excode != Exception::Syscall &&
-      g_state.cop0_regs.cause.Excode != Exception::BP)
-  {
-    Log_DevPrintf("Exception %u at 0x%08X (epc=0x%08X, BD=%s, CE=%u)",
-                  static_cast<u8>(g_state.cop0_regs.cause.Excode.GetValue()), g_state.current_instruction_pc,
-                  g_state.cop0_regs.EPC, g_state.cop0_regs.cause.BD ? "true" : "false",
-                  g_state.cop0_regs.cause.CE.GetValue());
-    DisassembleAndPrint(g_state.current_instruction_pc, 4, 0);
-    if (s_trace_to_log)
-    {
-      CPU::WriteToExecutionLog("Exception %u at 0x%08X (epc=0x%08X, BD=%s, CE=%u)\n",
-                               static_cast<u8>(g_state.cop0_regs.cause.Excode.GetValue()),
-                               g_state.current_instruction_pc, g_state.cop0_regs.EPC,
-                               g_state.cop0_regs.cause.BD ? "true" : "false", g_state.cop0_regs.cause.CE.GetValue());
-    }
-  }
-#endif
-
   if (g_state.cop0_regs.cause.BD)
   {
     // TAR is set to the address which was being fetched in this instruction, or the next instruction to execute if the
@@ -260,7 +251,7 @@ ALWAYS_INLINE_RELEASE static void RaiseException(u32 CAUSE_bits, u32 EPC, u32 ve
   // flush the pipeline - we don't want to execute the previously fetched instruction
   g_state.regs.npc = vector;
   g_state.exception_raised = true;
-  FlushPipeline();
+  FlushPipeline(true);
 }
 
 ALWAYS_INLINE_RELEASE static void DispatchCop0Breakpoint()
@@ -319,7 +310,7 @@ ALWAYS_INLINE_RELEASE static void UpdateLoadDelay()
   g_state.next_load_delay_reg = Reg::count;
 }
 
-ALWAYS_INLINE_RELEASE static void FlushPipeline()
+ALWAYS_INLINE_RELEASE static void FlushPipeline(bool isException)
 {
   // loads are flushed
   g_state.next_load_delay_reg = Reg::count;
@@ -334,8 +325,27 @@ ALWAYS_INLINE_RELEASE static void FlushPipeline()
   g_state.next_instruction_is_branch_delay_slot = false;
   g_state.current_instruction_pc = g_state.regs.pc;
 
+  if (isException)
+  {
+    tracer.isException = true;
+    tracer.exceptionOpcode = g_state.next_instruction.bits;
+  }
+
   // prefetch the next instruction
   FetchInstruction();
+  if (isException)
+  {
+    TickCount oldticks = g_state.pending_ticks;
+    g_state.regs.npc -= 4; FetchInstruction();
+    g_state.regs.npc -= 4; FetchInstruction();
+    if (oldticks == g_state.pending_ticks)
+      g_state.pending_ticks += 2;
+  }
+
+  if (tracer.isInterrupt)
+  {
+      tracer.exceptionOpcode = g_state.next_instruction.bits;
+  }
 
   // and set it as the next one to execute
   g_state.current_instruction.bits = g_state.next_instruction.bits;
@@ -629,19 +639,6 @@ ALWAYS_INLINE_RELEASE static void ExecuteInstruction()
 {
 restart_instruction:
   const Instruction inst = g_state.current_instruction;
-
-#if 0
-  if (g_state.current_instruction_pc == 0x80030000)
-  {
-    TRACE_EXECUTION = true;
-    __debugbreak();
-  }
-#endif
-
-#ifdef _DEBUG
-  if (TRACE_EXECUTION)
-    TracePrintInstruction();
-#endif
 
   // Skip nops. Makes PGXP-CPU quicker, but also the regular interpreter.
   if (inst.bits == 0)
@@ -1345,6 +1342,11 @@ restart_instruction:
     {
       g_state.next_instruction_is_branch_delay_slot = true;
       const bool branch = (ReadReg(inst.i.rs) != ReadReg(inst.i.rt));
+      u32 addr = g_state.regs.pc + (inst.i.imm_sext32() << 2);
+      if (addr == 0xbfc06be8)
+      {
+          int a = 5;
+      }
       if (branch)
         Branch(g_state.regs.pc + (inst.i.imm_sext32() << 2));
     }
@@ -1599,10 +1601,13 @@ void DispatchInterrupt()
     GTE::ExecuteInstruction(g_state.next_instruction.bits);
 
   // Interrupt raising occurs before the start of the instruction.
+  tracer.isInterrupt = true;
   RaiseException(
     Cop0Registers::CAUSE::MakeValueForException(Exception::INT, g_state.next_instruction_is_branch_delay_slot,
                                                 g_state.branch_was_taken, g_state.next_instruction.cop.cop_n),
     g_state.regs.pc);
+
+  g_state.pending_ticks++;
 }
 
 void UpdateDebugDispatcherFlag()
@@ -1864,6 +1869,1017 @@ ALWAYS_INLINE_RELEASE static bool BreakpointCheck()
   return System::IsPaused();
 }
 
+Tracer tracer;
+void cpustate::update(State g_state)
+{
+  this->ticks = tracer.totalticks;
+  this->newticks = g_state.lastticks + tracer.sumticks;
+  tracer.sumticks = 0;
+  this->pc = g_state.current_instruction_pc;
+
+  if (tracer.isException) 
+   this->opcode = tracer.exceptionOpcode;
+  else 
+    this->opcode = g_state.current_instruction.bits;
+
+  for (int i = 0; i < 32; i++)
+  {
+    this->regs[i] = g_state.regs.r[i];
+  }
+  if (g_state.load_delay_reg != Reg::count)
+    this->regs[static_cast<u8>(g_state.load_delay_reg)] = g_state.load_delay_value;
+
+  this->regs_hi = g_state.regs.hi;
+  this->regs_lo = g_state.regs.lo;
+
+  this->sr = g_state.cop0_regs.sr.bits;
+  this->cause = g_state.cop0_regs.cause.bits;
+
+  this->irq = g_interrupt_controller.m_interrupt_status_register;
+
+  this->gpu_time = g_gpu->m_crtc_tick_event->m_downcount;
+  this->gpu_line = g_gpu->m_crtc_state.current_scanline;
+  this->gpu_stat = g_gpu->m_GPUSTAT.bits;
+  this->fifocount = g_gpu->m_fifo.GetSize();
+  this->gpu_ticks = g_gpu->m_pending_command_ticks_last;
+
+  this->mdec_stat = g_mdec.m_status.bits;
+
+  this->cd_status = g_cdrom.m_status.bits | (g_cdrom.m_secondary_status.bits << 8);
+
+  for (int i = 0; i < 3; i++)
+  {
+      this->timer[i] = g_timers.m_states[i].counter;
+  }
+
+  //this->debug8 = Bus::g_ram[0x001ffe98];
+  //this->debug8 = g_gpu->m_crtc_state.interlaced_field;
+  //this->debug8 = g_dma.m_state[4].request;
+  this->debug8 = g_spu.m_transfer_fifo.GetSize();
+  //this->debug16 = g_gpu->m_vram_ptr[0x7FFFC];
+  this->debug16 = g_spu.m_SPUSTAT.bits;
+  //this->debug32 = *(uint32_t*)&Bus::g_ram[0x7abd0];
+  //this->debug32 = *(uint32_t*)&g_state.dcache[0x08];
+  //this->debug32 = g_cdrom.m_command_event->m_downcount;
+  //this->debug32 = g_gpu->m_command_tick_event->m_downcount;
+  this->debug32 = g_spu.m_transfer_event->m_downcount;
+  //this->debug32 = g_mdec.m_block_copy_out_event->m_downcount;
+  //this->debug32 = g_gpu->m_crtc_state.vertical_display_end;
+  //this->debug32 = g_gpu->m_GPUREAD_latch;
+}
+
+inline void printsingle(FILE* file, uint32_t value, const char * name, int size)
+{
+  char buf[10];
+  fputs(name, file);
+  fputc(' ', file);
+  _itoa(value, buf, 16);
+  for (int c = strlen(buf); c < size; c++) fputc('0', file);
+  fputs(buf, file);
+  //fputc('\n', file);
+  fputc(' ', file);
+}
+
+inline void printchange(FILE* file, uint32_t oldvalue, uint32_t newvalue, const char* name, int size)
+{
+  char buf[10];
+  fputs(name, file);
+  fputc(' ', file);
+  //_itoa(oldvalue, buf, 16);
+  //for (int c = strlen(buf); c < size; c++) fputc('0', file);
+  //fputs(buf, file);
+  //fputc(' ', file);
+  _itoa(newvalue, buf, 16);
+  for (int c = strlen(buf); c < size; c++) fputc('0', file);
+  fputs(buf, file);
+  //fputc('\n', file);
+  fputc(' ', file);
+}
+
+void Tracer::VramOutWriteFile()
+{
+#ifdef VRAMFILEOUT
+    FILE* file = fopen("R:\\debug_gpu_duck.txt", "w");
+
+    for (int i = 0; i < tracer.debug_VramOutCount; i++)
+    {
+        if (debug_VramOutType[i] == 1) fputs("Pixel: ", file);
+        if (debug_VramOutType[i] == 2) fputs("Fifo: ", file);
+        if (debug_VramOutType[i] == 3) fputs("LinkedList: ", file);
+        char buf[10];
+        _itoa(tracer.debug_VramOutTime[i], buf, 16);
+        for (int c = strlen(buf); c < 8; c++) fputc('0', file);
+        fputs(buf, file);
+        fputc(' ', file);
+        _itoa(tracer.debug_VramOutAddr[i], buf, 16);
+        for (int c = strlen(buf); c < 8; c++) fputc('0', file);
+        fputs(buf, file);
+        fputc(' ', file);
+        _itoa(tracer.debug_VramOutData[i], buf, 16);
+        for (int c = strlen(buf); c < 4; c++) fputc('0', file);
+        fputs(buf, file);
+    
+        fputc('\n', file);
+    }
+    fclose(file);
+
+    file = fopen("R:\\debug_pixel_duck.txt", "w");
+
+    for (int i = 0; i < debug_VramOutCount; i++)
+    {
+        if (debug_VramOutType[i] == 1)
+        {
+            char buf[10];
+            uint16_t x = (debug_VramOutAddr[i] >> 1) & 0x3FF;
+            uint16_t y = (debug_VramOutAddr[i] >> 11) & 0x1FF;
+            _itoa(x, buf, 10);
+            fputs(buf, file);
+            fputc(' ', file);
+            _itoa(y, buf, 10);
+            fputs(buf, file);
+            fputc(' ', file);
+            _itoa(debug_VramOutData[i], buf, 10);
+            fputs(buf, file);
+            fputc('\n', file);
+        }
+    }
+    fclose(file);
+#endif
+}
+
+void Tracer::GTEoutWriteFile()
+{
+#ifdef GTEFILEOUT
+    FILE* file = fopen("R:\\debug_gte_duck.txt", "w");
+
+    for (int i = 0; i < tracer.debug_GTEOutCount; i++)
+    {
+        if (debug_GTEOutType[i] == 1) fputs("COMMAND: ", file);
+        if (debug_GTEOutType[i] == 2) fputs("WRITE REG: ", file);
+        if (debug_GTEOutType[i] == 3) fputs("COMMAND REG: ", file);
+        char buf[10];
+        _itoa(tracer.debug_GTEOutTime[i], buf, 16);
+        for (int c = strlen(buf); c < 8; c++) fputc('0', file);
+        fputs(buf, file);
+        fputc(' ', file);
+        _itoa(tracer.debug_GTEOutAddr[i], buf, 10);
+        for (int c = strlen(buf); c < 2; c++) fputc('0', file);
+        fputs(buf, file);
+        fputc(' ', file);
+        _itoa(tracer.debug_GTEOutData[i], buf, 16);
+        for (int c = strlen(buf); c < 8; c++) fputc('0', file);
+        fputs(buf, file);
+
+        fputc('\n', file);
+    }
+    fclose(file);
+
+    file = fopen("R:\\gte_test_duck.txt", "w");
+
+    for (int i = 0; i < tracer.debug_GTEOutCount; i++)
+    {
+        if (tracer.debug_GTEOutType[i] < 3)
+        {
+            char buf[10];
+            _itoa(tracer.debug_GTEOutType[i], buf, 16);
+            for (int c = strlen(buf); c < 2; c++) fputc('0', file);
+            fputs(buf, file);
+            fputc(' ', file);
+            _itoa(tracer.debug_GTEOutAddr[i], buf, 16);
+            for (int c = strlen(buf); c < 2; c++) fputc('0', file);
+            fputs(buf, file);
+            fputc(' ', file);
+            _itoa(tracer.debug_GTEOutData[i], buf, 16);
+            for (int c = strlen(buf); c < 8; c++) fputc('0', file);
+            fputs(buf, file);
+
+            fputc('\n', file);
+        }
+    }
+    fclose(file);
+#endif
+}
+
+void Tracer::GTEoutRegCapture(uint8_t regtype)
+{
+#ifdef GTEFILEOUT
+    if (debug_GTEOutCount >= 1000000 - 64) return;
+
+    for (int i = 0; i < 64; i++)
+    {
+        if (debug_GTELast[i] != g_state.gte_regs.r32[i])
+        {
+            CPU::tracer.debug_GTEOutTime[CPU::tracer.debug_GTEOutCount] = tracer.commands;
+            CPU::tracer.debug_GTEOutAddr[CPU::tracer.debug_GTEOutCount] = i;
+            CPU::tracer.debug_GTEOutData[CPU::tracer.debug_GTEOutCount] = g_state.gte_regs.r32[i];
+            CPU::tracer.debug_GTEOutType[CPU::tracer.debug_GTEOutCount] = regtype;
+            CPU::tracer.debug_GTEOutCount++;
+            debug_GTELast[i] = g_state.gte_regs.r32[i];
+        }
+    }
+#endif
+}
+
+void Tracer::GTEoutCommandCapture(uint32_t command)
+{
+#ifdef GTEFILEOUT
+    if (debug_GTEOutCount >= 1000000) return;
+
+    CPU::tracer.debug_GTEOutTime[CPU::tracer.debug_GTEOutCount] = tracer.commands;
+    CPU::tracer.debug_GTEOutAddr[CPU::tracer.debug_GTEOutCount] = 0;
+    CPU::tracer.debug_GTEOutData[CPU::tracer.debug_GTEOutCount] = command;
+    CPU::tracer.debug_GTEOutType[CPU::tracer.debug_GTEOutCount] = 1;
+    CPU::tracer.debug_GTEOutCount++;
+#endif
+}
+
+void Tracer::GTETest()
+{
+    std::ifstream infile("R:\\gte_test_duck.txt");
+    std::string line;
+    while (std::getline(infile, line))
+    {
+        std::string type = line.substr(0, 2);
+        std::string addr = line.substr(3, 2);
+        std::string data = line.substr(6, 8);
+        u8 typeI = std::stoul(type, nullptr, 16);
+        u8 addrI = std::stoul(addr, nullptr, 16);
+        u32 dataI = std::stoul(data, nullptr, 16);
+        switch (typeI)
+        {
+        case 1:  GTE::ExecuteInstruction(dataI); break;
+        case 2:  GTE::WriteRegister(addrI, dataI); break;
+        }
+    }
+
+    GTEoutWriteFile();
+}
+
+void Tracer::MDECOutCapture(uint8_t type, uint8_t addr, uint32_t data)
+{
+#ifdef MDECFILEOUT
+    if (debug_MDECOutCount == 694758)
+    {
+        int a = 5;
+    }
+
+    if (CPU::tracer.debug_MDECOutCount >= 1000000) return;
+
+    //CPU::tracer.debug_MDECOutTime[CPU::tracer.debug_MDECOutCount] = totalticks + CPU::g_state.pending_ticks - 1;
+    CPU::tracer.debug_MDECOutTime[CPU::tracer.debug_MDECOutCount] = totalticks;
+    CPU::tracer.debug_MDECOutAddr[CPU::tracer.debug_MDECOutCount] = addr;
+    CPU::tracer.debug_MDECOutData[CPU::tracer.debug_MDECOutCount] = data;
+    CPU::tracer.debug_MDECOutType[CPU::tracer.debug_MDECOutCount] = type;
+    CPU::tracer.debug_MDECOutCount++;
+#endif
+}
+
+void Tracer::MDECOutWriteFile(bool writeTest)
+{
+#ifdef MDECFILEOUT
+    FILE* file = fopen("R:\\debug_mdec_duck.txt", "w");
+
+    for (int i = 0; i < tracer.debug_MDECOutCount; i++)
+    {
+        if (debug_MDECOutType[i] == 1) fputs("Pixel: ", file);
+        if (debug_MDECOutType[i] == 2) fputs("Fifo: ", file);
+        if (debug_MDECOutType[i] == 3) fputs("Blockendpos: ", file);
+        if (debug_MDECOutType[i] == 4) fputs("Blockresult: ", file);
+        if (debug_MDECOutType[i] == 5) fputs("IDCTresult: ", file);
+        if (debug_MDECOutType[i] == 6) fputs("FIFOLeft: ", file);
+        if (debug_MDECOutType[i] == 7) fputs("CPUREAD: ", file);
+        if (debug_MDECOutType[i] == 8) fputs("CPUWRITE: ", file);
+        if (debug_MDECOutType[i] == 9) fputs("DMAREAD: ", file);
+        if (debug_MDECOutType[i] == 10) fputs("DMAWRITE: ", file);
+        if (debug_MDECOutType[i] == 11) fputs("EVENT: ", file);
+        char buf[10];
+        _itoa(tracer.debug_MDECOutTime[i], buf, 16);
+        for (int c = strlen(buf); c < 8; c++) fputc('0', file);
+        fputs(buf, file);
+        fputc(' ', file);
+        _itoa(tracer.debug_MDECOutAddr[i], buf, 16);
+        for (int c = strlen(buf); c < 2; c++) fputc('0', file);
+        fputs(buf, file);
+        fputc(' ', file);
+        _itoa(tracer.debug_MDECOutData[i], buf, 16);
+        for (int c = strlen(buf); c < 8; c++) fputc('0', file);
+        fputs(buf, file);
+
+        fputc('\n', file);
+    }
+    fclose(file);
+
+    if (writeTest)
+    {
+        file = fopen("R:\\mdec_test_duck.txt", "w");
+
+        for (int i = 0; i < tracer.debug_MDECOutCount; i++)
+        {
+            if (debug_MDECOutType[i] >= 7)
+            {
+                char buf[10];
+                _itoa(tracer.debug_MDECOutType[i], buf, 16);
+                for (int c = strlen(buf); c < 2; c++) fputc('0', file);
+                fputs(buf, file);
+                fputc(' ', file);
+                _itoa(tracer.debug_MDECOutTime[i], buf, 16);
+                for (int c = strlen(buf); c < 8; c++) fputc('0', file);
+                fputs(buf, file);
+                fputc(' ', file);
+                _itoa(tracer.debug_MDECOutAddr[i], buf, 16);
+                for (int c = strlen(buf); c < 2; c++) fputc('0', file);
+                fputs(buf, file);
+                fputc(' ', file);
+                _itoa(tracer.debug_MDECOutData[i], buf, 16);
+                for (int c = strlen(buf); c < 8; c++) fputc('0', file);
+                fputs(buf, file);
+
+                fputc('\n', file);
+            }
+        }
+        fclose(file);
+    }
+#endif
+}
+
+void Tracer::MDECTest()
+{
+    std::ifstream infile("R:\\mdec_test_duck.txt");
+    std::string line;
+    u32 timer = 0;
+    //CPU::g_state.pending_ticks = 1;
+    while (std::getline(infile, line))
+    {
+        std::string type = line.substr(0, 2);
+        std::string time = line.substr(3, 8);
+        std::string addr = line.substr(12, 2);
+        std::string data = line.substr(15, 8);
+        u8 typeI = std::stoul(type, nullptr, 16);
+        u32 timeI = std::stoul(time, nullptr, 16);
+        u8 addrI = std::stoul(addr, nullptr, 16);
+        u32 dataI = std::stoul(data, nullptr, 16);
+        while (timer < timeI)
+        {
+            timer++;
+            totalticks++;
+            if (g_mdec.m_block_copy_out_event->m_active)
+            {
+                g_mdec.m_block_copy_out_event->m_downcount--;
+                if (g_mdec.m_block_copy_out_event->m_downcount <= 0)
+                {
+                    g_mdec.m_block_copy_out_event->m_downcount += g_mdec.m_block_copy_out_event->m_interval;
+                    g_mdec.CopyOutBlock();
+                }
+            }
+        }
+        switch (typeI)
+        {
+        case 7:  g_mdec.ReadRegister(addrI); break;
+        case 8:  g_mdec.WriteRegister(addrI, dataI); break;
+
+        case 9:
+        {
+            u32* dest_pointer = reinterpret_cast<u32*>(&Bus::g_ram[0]);
+            g_mdec.DMARead(dest_pointer, dataI);
+            if (g_mdec.m_data_out_fifo.IsEmpty())
+            {
+                g_mdec.Execute();
+            }
+        }
+        break;
+
+        case 10:
+            CPU::tracer.MDECOutCapture(10, 0, dataI);
+            g_mdec.WriteCommandRegister(dataI);
+            break;
+
+        case 11:
+            if (g_mdec.m_block_copy_out_event->m_active)
+            {
+                g_mdec.CopyOutBlock();
+            }
+        }
+    }
+
+    MDECOutWriteFile(false);
+}
+
+void Tracer::CDOutCapture(uint8_t type, uint8_t addr, uint32_t data)
+{
+#ifdef CDFILEOUT
+    if (debug_CDOutCount == 712562)
+    {
+        int a = 5;
+    }
+
+    if (debug_CDOutCount >= CDFILEOUTMAX) return;
+
+    debug_CDOutTime[debug_CDOutCount] = totalticks;
+    debug_CDOutAddr[debug_CDOutCount] = addr;
+    debug_CDOutData[debug_CDOutCount] = data;
+    debug_CDOutType[debug_CDOutCount] = type;
+    debug_CDOutCount++;
+#endif
+}
+
+void Tracer::XAOutCapture(uint8_t type, uint32_t data)
+{
+#ifdef CDFILEOUT
+    if (debug_XAOutCount >= 1000000) return;
+
+    if (data != 0)
+    {
+        int a = 5;
+    }
+
+    debug_XAOutType[debug_XAOutCount] = type;
+    debug_XAOutData[debug_XAOutCount] = data;
+    debug_XAOutCount++;
+#endif
+}
+
+void Tracer::CDOutWriteFile(bool writeTest)
+{
+#ifdef CDFILEOUT
+    FILE* file = fopen("R:\\debug_cd_duck.txt", "w");
+
+    for (int i = 0; i < tracer.debug_CDOutCount; i++)
+    {
+        if (debug_CDOutType[i] == 1) fputs("CMD: ", file);
+        if (debug_CDOutType[i] == 2) fputs("DATA: ", file);
+        if (debug_CDOutType[i] == 3) fputs("RSPFIFO: ", file);
+        if (debug_CDOutType[i] == 4) fputs("RSPFIFO2: ", file);
+        if (debug_CDOutType[i] == 5) fputs("RSPERROR: ", file);
+        if (debug_CDOutType[i] == 7) fputs("WPTR: ", file);
+        if (debug_CDOutType[i] == 8) fputs("CPUREAD: ", file);
+        if (debug_CDOutType[i] == 9) fputs("CPUWRITE: ", file);
+        if (debug_CDOutType[i] == 10) fputs("DMAREAD: ", file);
+        if (debug_CDOutType[i] == 11) fputs("CDDAOUT: ", file);
+        if (debug_CDOutType[i] == 12) fputs("SECTORREAD: ", file);
+        char buf[10];
+        _itoa(tracer.debug_CDOutTime[i], buf, 16);
+        for (int c = strlen(buf); c < 8; c++) fputc('0', file);
+        fputs(buf, file);
+        fputc(' ', file);
+        _itoa(tracer.debug_CDOutAddr[i], buf, 16);
+        for (int c = strlen(buf); c < 2; c++) fputc('0', file);
+        fputs(buf, file);
+        fputc(' ', file);
+        _itoa(tracer.debug_CDOutData[i], buf, 16);
+        for (int c = strlen(buf); c < 8; c++) fputc('0', file);
+        fputs(buf, file);
+
+        fputc('\n', file);
+    }
+    fclose(file);
+
+    file = fopen("R:\\debug_xa_duck.txt", "w");
+    for (int i = 0; i < tracer.debug_XAOutCount; i++)
+    {
+        if (debug_XAOutType[i] == 1) fputs("DATAIN: ", file);
+        if (debug_XAOutType[i] == 2) fputs("ADPCMCALC: ", file);
+        if (debug_XAOutType[i] == 3) fputs("ADPCMOUT: ", file);
+        if (debug_XAOutType[i] == 4) fputs("OUT: ", file);
+        char buf[10];
+        _itoa(i, buf, 16);
+        for (int c = strlen(buf); c < 6; c++) fputc('0', file);
+        fputs(buf, file);
+        fputc(' ', file);
+        _itoa(tracer.debug_XAOutData[i], buf, 16);
+        for (int c = strlen(buf); c < 8; c++) fputc('0', file);
+        fputs(buf, file);
+
+        fputc('\n', file);
+    }
+    fclose(file);
+
+    if (writeTest)
+    {
+        file = fopen("R:\\cd_test_duck.txt", "w");
+
+        for (int i = 0; i < tracer.debug_CDOutCount; i++)
+        {
+            if (debug_CDOutType[i] >= 8)
+            {
+                char buf[10];
+                _itoa(tracer.debug_CDOutType[i], buf, 16);
+                for (int c = strlen(buf); c < 2; c++) fputc('0', file);
+                fputs(buf, file);
+                fputc(' ', file);
+                _itoa(tracer.debug_CDOutTime[i], buf, 16);
+                for (int c = strlen(buf); c < 8; c++) fputc('0', file);
+                fputs(buf, file);
+                fputc(' ', file);
+                _itoa(tracer.debug_CDOutAddr[i], buf, 16);
+                for (int c = strlen(buf); c < 2; c++) fputc('0', file);
+                fputs(buf, file);
+                fputc(' ', file);
+                _itoa(tracer.debug_CDOutData[i], buf, 16);
+                for (int c = strlen(buf); c < 8; c++) fputc('0', file);
+                fputs(buf, file);
+
+                fputc('\n', file);
+            }
+        }
+        fclose(file);
+    }
+#endif
+}
+
+void Tracer::CDTest()
+{
+    std::ifstream infile("R:\\cd_test_duck.txt");
+    std::string line;
+    u32 timer = 0;
+    while (std::getline(infile, line))
+    {
+        std::string type = line.substr(0, 2);
+        std::string time = line.substr(3, 8);
+        std::string addr = line.substr(12, 2);
+        std::string data = line.substr(15, 8);
+        u8 typeI = std::stoul(type, nullptr, 16);
+        u32 timeI = std::stoul(time, nullptr, 16);
+        u8 addrI = std::stoul(addr, nullptr, 16);
+        u32 dataI = std::stoul(data, nullptr, 16);
+        while (timer < timeI)
+        {
+            timer++;
+            totalticks++;
+            TimingEvents::AddGlobalTickCounter();
+            if (g_cdrom.m_command_event->m_active)
+            {
+                g_cdrom.m_command_event->m_downcount--;
+                if (g_cdrom.m_command_event->m_downcount <= 0)
+                {
+                    g_cdrom.m_command_event->m_downcount += g_cdrom.m_command_event->m_interval;
+                    g_cdrom.ExecuteCommand(0);
+                }
+            }
+            if (g_cdrom.m_command_second_response_event->m_active)
+            {
+                g_cdrom.m_command_second_response_event->m_downcount--;
+                if (g_cdrom.m_command_second_response_event->m_downcount <= 0)
+                {
+                    g_cdrom.m_command_second_response_event->m_downcount += g_cdrom.m_command_second_response_event->m_interval;
+                    g_cdrom.ExecuteCommandSecondResponse(0);
+                }
+            }
+            if (g_cdrom.m_drive_event->m_active)
+            {
+                g_cdrom.m_drive_event->m_downcount--;
+                if (g_cdrom.m_drive_event->m_downcount <= 0)
+                {
+                    g_cdrom.m_drive_event->m_downcount += g_cdrom.m_drive_event->m_interval;
+                    g_cdrom.ExecuteDrive(0);
+                }
+            }
+        }
+
+        switch (typeI)
+        {
+        case 8:  g_cdrom.ReadRegister(addrI); break;
+        case 9:  g_cdrom.WriteRegister(addrI, dataI); break;
+        case 10:
+        {
+            u32* dest_pointer = reinterpret_cast<u32*>(&Bus::g_ram[0]);
+            g_cdrom.DMARead(dest_pointer, dataI);
+        }
+            break;
+        }
+    }
+
+    CDOutWriteFile(false);
+}
+
+void Tracer::PadOutCapture(uint8_t addr, uint16_t data, uint8_t type)
+{
+    if (type < 8) return;
+
+#ifdef PADFILEOUT
+    if (debug_PadOutCount >= 1000000) return;
+
+    debug_PadOutTime[debug_PadOutCount] = totalticks;
+    debug_PadOutAddr[debug_PadOutCount] = addr;
+    debug_PadOutData[debug_PadOutCount] = data;
+    debug_PadOutType[debug_PadOutCount] = type;
+    debug_PadOutCount++;
+#endif
+}
+
+void Tracer::PadOutWriteFile(bool writeTest)
+{
+#ifdef PADFILEOUT
+    FILE* file = fopen("R:\\debug_pad_duck.txt", "w");
+
+    for (int i = 0; i < tracer.debug_PadOutCount; i++)
+    {
+        if (debug_PadOutType[i] == 1) fputs("WRITE: ", file);
+        if (debug_PadOutType[i] == 2) fputs("READ: ", file);
+        if (debug_PadOutType[i] == 3) fputs("TRANSMIT: ", file);
+        if (debug_PadOutType[i] == 4) fputs("IRQ: ", file);
+        if (debug_PadOutType[i] == 5) fputs("BEGINTRANSFER: ", file);
+        if (debug_PadOutType[i] == 6) fputs("READMEMBLOCK: ", file);
+        if (debug_PadOutType[i] == 7) fputs("READMEMDATA: ", file);
+        if (debug_PadOutType[i] == 8) fputs("RESETCONTROLLER: ", file);
+        if (debug_PadOutType[i] == 9) fputs("TRANSFER: ", file);
+        char buf[10];
+        //_itoa(tracer.debug_PadOutTime[i], buf, 16);
+        //for (int c = strlen(buf); c < 8; c++) fputc('0', file);
+        //fputs(buf, file);
+        //fputc(' ', file);
+        _itoa(tracer.debug_PadOutAddr[i], buf, 16);
+        for (int c = strlen(buf); c < 2; c++) fputc('0', file);
+        fputs(buf, file);
+        fputc(' ', file);
+        _itoa(tracer.debug_PadOutData[i], buf, 16);
+        for (int c = strlen(buf); c < 4; c++) fputc('0', file);
+        fputs(buf, file);
+
+        fputc('\n', file);
+    }
+    fclose(file);
+
+    if (writeTest)
+    {
+        file = fopen("R:\\pad_test_duck.txt", "w");
+
+        for (int i = 0; i < tracer.debug_PadOutCount; i++)
+        {
+            if (debug_PadOutType[i] < 8) continue;
+            char buf[10];
+            _itoa(tracer.debug_PadOutType[i], buf, 16);
+            for (int c = strlen(buf); c < 2; c++) fputc('0', file);
+            fputs(buf, file);
+            fputc(' ', file);
+            _itoa(tracer.debug_PadOutAddr[i], buf, 16);
+            for (int c = strlen(buf); c < 2; c++) fputc('0', file);
+            fputs(buf, file);
+            fputc(' ', file);
+            _itoa(tracer.debug_PadOutData[i], buf, 16);
+            for (int c = strlen(buf); c < 2; c++) fputc('0', file);
+            fputs(buf, file);
+
+            fputc('\n', file);
+        }
+        fclose(file);
+    }
+#endif
+}
+
+void Tracer::PadTest()
+{
+#ifdef PADFILEOUT
+    tracer.debug_PadOutCount = 0;
+#endif
+    std::ifstream infile("R:\\pad_test_duck.txt");
+    std::string line;
+    u32 timer = 0;
+    while (std::getline(infile, line))
+    {
+        std::string type = line.substr(0, 2);
+        std::string addr = line.substr(3, 2);
+        std::string data = line.substr(6, 2);
+        u8 typeI = std::stoul(type, nullptr, 16);
+        u8 addrI = std::stoul(addr, nullptr, 16);
+        u8 dataI = std::stoul(data, nullptr, 16);
+       
+        switch (typeI)
+        {
+
+        case 8: g_pad.ResetDeviceTransferState(); break;
+        case 9:
+        {
+            u8 data_out = addrI;
+            u8 data_in = 0xFF;
+            g_pad.m_controllers[0]->Transfer(data_out, &data_in);
+            PadOutCapture(data_out, data_in, 9);
+        }
+        break;
+        }
+    }
+
+    PadOutWriteFile(false);
+}
+
+void Tracer::SPUOutCapture(uint16_t addr, uint16_t data, uint8_t type, uint8_t timeadd)
+{
+#ifdef SPUFILEOUT
+    if (debug_SPUOutCount == 2789427)
+    {
+        int a = 5;
+    }
+
+    if (debug_SPUOutCount >= SPUFILEOUTMAX) 
+        return;
+
+    if (!debug_SPUOutAll && type > 4) return;
+
+    debug_SPUOutTime[debug_SPUOutCount] = totalticks + timeadd;
+    debug_SPUOutAddr[debug_SPUOutCount] = addr;
+    debug_SPUOutData[debug_SPUOutCount] = data;
+    debug_SPUOutType[debug_SPUOutCount] = type;
+    debug_SPUOutCount++;
+#endif
+}
+
+void Tracer::SPUOutWriteFile(bool writeTest)
+{
+#ifdef SPUFILEOUT
+    FILE* file = fopen("R:\\debug_sound_duck.txt", "w");
+
+    for (int i = 0; i < debug_SPUOutCount; i++)
+    {
+        if (debug_SPUOutType[i] == 1) fputs("WRITEREG: ", file);
+        if (debug_SPUOutType[i] == 2) fputs("READREG: ", file);
+        if (debug_SPUOutType[i] == 3) fputs("DMAWRITE: ", file);
+        if (debug_SPUOutType[i] == 4) fputs("DMAREAD: ", file);
+        if (debug_SPUOutType[i] == 5) fputs("SAMPLEOUT: ", file);
+        if (debug_SPUOutType[i] == 6) fputs("ADPCM: ", file);
+        if (debug_SPUOutType[i] == 7) fputs("CHAN: ", file);
+        if (debug_SPUOutType[i] == 8) fputs("ADSRTICKS: ", file);
+        if (debug_SPUOutType[i] == 9) fputs("REVERBWRITE: ", file);
+        if (debug_SPUOutType[i] == 10) fputs("REVERBREAD: ", file);
+        if (debug_SPUOutType[i] == 11) fputs("REVERBSAMPLE: ", file);
+        if (debug_SPUOutType[i] == 12) fputs("CAPTURE: ", file);
+        if (debug_SPUOutType[i] == 13) fputs("ENVCHAN: ", file);
+        if (debug_SPUOutType[i] == 14) fputs("NOISE: ", file);
+        if (debug_SPUOutType[i] == 15) fputs("DMARAM: ", file);
+        if (debug_SPUOutType[i] == 16) fputs("ADSRVOLUME: ", file);
+        if (debug_SPUOutType[i] == 17) fputs("IRQ: ", file);
+        if (debug_SPUOutType[i] == 18) fputs("VOICEADDRESS: ", file);
+        char buf[10];
+        _itoa(debug_SPUOutTime[i], buf, 16);
+        for (int c = strlen(buf); c < 8; c++) fputc('0', file);
+        fputs(buf, file);
+        fputc(' ', file);
+        _itoa(debug_SPUOutAddr[i], buf, 16);
+        for (int c = strlen(buf); c < 4; c++) fputc('0', file);
+        fputs(buf, file);
+        fputc(' ', file);
+        _itoa(debug_SPUOutData[i], buf, 16);
+        for (int c = strlen(buf); c < 4; c++) fputc('0', file);
+        fputs(buf, file);
+
+        fputc('\n', file);
+    }
+    fclose(file);
+
+    if (writeTest)
+    {
+        file = fopen("R:\\sound_test_duck.txt", "w");
+
+        for (int i = 0; i < debug_SPUOutCount; i++)
+        {
+            if (debug_SPUOutType[i] <= 4)
+            {
+                char buf[10];
+                _itoa(debug_SPUOutType[i], buf, 16);
+                for (int c = strlen(buf); c < 2; c++) fputc('0', file);
+                fputs(buf, file);
+                fputc(' ', file);
+                _itoa(debug_SPUOutTime[i], buf, 16);
+                for (int c = strlen(buf); c < 8; c++) fputc('0', file);
+                fputs(buf, file);
+                fputc(' ', file);
+                _itoa(debug_SPUOutAddr[i], buf, 16);
+                for (int c = strlen(buf); c < 4; c++) fputc('0', file);
+                fputs(buf, file);
+                fputc(' ', file);
+                _itoa(debug_SPUOutData[i], buf, 16);
+                for (int c = strlen(buf); c < 4; c++) fputc('0', file);
+                fputs(buf, file);
+
+                fputc('\n', file);
+            }
+        }
+        fclose(file);
+    }
+#endif
+}
+
+void Tracer::SPUTest()
+{
+    std::ifstream infile("R:\\sound_test_duck.txt");
+    std::string line;
+    u32 timer = 0;
+    u32 dmaTicks = 0;
+    int cmdcnt = 0;
+    g_spu.m_tick_event->m_time_since_last_run = 1;
+    g_spu.m_tick_event->m_downcount = 767;
+
+    g_spu.m_ram.fill(0);
+    for (u32 i = 0; i < g_spu.NUM_VOICES; i++)
+    {
+        g_spu.m_voices[i].current_address = 0;
+        std::fill_n(g_spu.m_voices[i].regs.index, g_spu.NUM_VOICE_REGISTERS, u16(0));
+        g_spu.m_voices[i].counter.bits = 0;
+        g_spu.m_voices[i].current_block_flags.bits = 0;
+        g_spu.m_voices[i].is_first_block = 0;
+        g_spu.m_voices[i].current_block_samples.fill(s16(0));
+        g_spu.m_voices[i].adpcm_last_samples.fill(s32(0));
+        g_spu.m_voices[i].adsr_envelope.Reset(0, false, false);
+        g_spu.m_voices[i].adsr_phase = SPU::ADSRPhase::Off;
+        g_spu.m_voices[i].adsr_target = 0;
+        g_spu.m_voices[i].has_samples = false;
+        g_spu.m_voices[i].ignore_loop_address = false;
+    }
+
+    while (std::getline(infile, line))
+    {
+        std::string type = line.substr(0, 2);
+        std::string time = line.substr(3, 8);
+        std::string addr = line.substr(12, 4);
+        std::string data = line.substr(17, 4);
+        u8 typeI = std::stoul(type, nullptr, 16);
+        u32 timeI = std::stoul(time, nullptr, 16);
+        u16 addrI = std::stoul(addr, nullptr, 16);
+        u16 dataI = std::stoul(data, nullptr, 16);
+        while (timer < timeI)
+        {
+            timer++;
+            totalticks++;
+            TimingEvents::AddGlobalTickCounter();
+            g_spu.m_tick_event->m_time_since_last_run++;
+            g_spu.m_transfer_event->m_time_since_last_run++;
+            if (g_spu.m_tick_event->m_active)
+            {
+                g_spu.m_tick_event->m_downcount--;
+                if (g_spu.m_tick_event->m_downcount <= 0)
+                {
+                    g_spu.m_tick_event->m_downcount += g_spu.m_tick_event->m_interval;
+                    g_spu.Execute(g_spu.m_tick_event->m_time_since_last_run);
+                    g_spu.m_tick_event->m_time_since_last_run = 0;
+                }
+            }
+            if (g_spu.m_transfer_event->m_active)
+            {
+                g_spu.m_transfer_event->m_downcount--;
+                if (g_spu.m_transfer_event->m_downcount <= 0)
+                {
+                    g_spu.m_transfer_event->m_downcount += g_spu.m_transfer_event->m_interval;
+                    g_spu.ExecuteTransfer(g_spu.m_transfer_event->m_time_since_last_run);
+                    g_spu.m_transfer_event->m_time_since_last_run = 0;
+                }
+            }
+        }
+
+        if (timer == 0x1ec7460a)
+        {
+            int a = 5;
+        }
+
+        switch (typeI)
+        {
+        case 1: g_spu.WriteRegister(addrI, dataI); break;
+        case 2: g_spu.ReadRegister(addrI); break;
+        case 3: 
+            g_spu.m_transfer_fifo.Push(dataI); 
+            SPUOutCapture(addrI, dataI, 3, 0);
+            if (addrI == 1)
+            {
+                dmaTicks = 0;
+            }
+            else dmaTicks++;
+            if (addrI == 3)
+            {
+                g_spu.UpdateDMARequest();
+                g_spu.UpdateTransferEvent();
+                g_spu.m_transfer_event->m_downcount -= dmaTicks;
+                g_spu.m_transfer_event->m_time_since_last_run += dmaTicks;
+            }
+            break;
+        case 4: 
+            u16 retval = g_spu.m_transfer_fifo.Pop();
+            SPUOutCapture(addrI, retval, 4, 0);
+            if (addrI == 1) dmaTicks = 0; else dmaTicks++;
+            if (addrI == 3)
+            {
+                g_spu.UpdateDMARequest();
+                g_spu.UpdateTransferEvent();
+                g_spu.m_transfer_event->m_downcount -= dmaTicks;
+                g_spu.m_transfer_event->m_time_since_last_run += dmaTicks;
+            }
+            break;
+        break;
+        }
+        cmdcnt++;
+    }
+
+    SPUOutWriteFile(false);
+}
+
+void Tracer::trace_file_last()
+{
+    FILE* file;
+    if (tracer.debug_outdiv == 1) file = fopen("R:\\debug_duck.txt", "w");
+    else file = fopen("R:\\debug_duck_n.txt", "w");
+
+    for (int i = 0; i < traclist_ptr; i++)
+    {
+        cpustate laststate = Tracelist[i];
+        cpustate state = Tracelist[i];
+        if (i > 0)
+        {
+          laststate = Tracelist[i - 1];
+        }
+
+        printsingle(file, state.ticks, "#", 8);
+        printsingle(file, state.newticks, "#", 3);
+        printsingle(file, state.pc, "PC", 8);
+        printsingle(file, state.opcode, "OP", 8);
+
+        for (int j = 0; j < 32; j++)
+        {
+          if (i == 0 || state.regs[j] != laststate.regs[j])
+          {
+            fputc('R', file);
+            char buf[10];
+            _itoa(j, buf, 10);
+            if (j < 10) fputc('0', file);
+            printchange(file, laststate.regs[j], state.regs[j], buf, 8);
+          }
+        }
+
+        //if (i == 0 || state.regs_hi != laststate.regs_hi) printchange(file, laststate.regs_hi, state.regs_hi, "HI", 8);
+        //if (i == 0 || state.regs_lo != laststate.regs_lo) printchange(file, laststate.regs_lo, state.regs_lo, "LO", 8);
+
+        //if (i == 0 || state.sr != laststate.sr) printchange(file, laststate.sr, state.sr, "SR", 8);
+        if (i == 0 || state.cause != laststate.cause) printchange(file, laststate.cause, state.cause, "CAUSE", 8);
+
+        if (i == 0 || state.irq != laststate.irq) printchange(file, laststate.irq, state.irq, "IRQ", 4);
+
+        if (i == 0 || state.gpu_time != laststate.gpu_time) printchange(file, laststate.gpu_time, state.gpu_time, "GTM", 3);
+        if (i == 0 || state.gpu_line != laststate.gpu_line) printchange(file, laststate.gpu_line, state.gpu_line, "LINE", 3);
+        if (i == 0 || state.gpu_stat != laststate.gpu_stat) printchange(file, laststate.gpu_stat, state.gpu_stat, "GPUS", 8);
+        if (i == 0 || state.fifocount != laststate.fifocount) printchange(file, laststate.fifocount, state.fifocount, "FIFO", 4);
+        if (i == 0 || state.gpu_ticks > 0) printchange(file, laststate.gpu_ticks, state.gpu_ticks, "GTCK", 4);
+
+        if (i == 0 || state.mdec_stat != laststate.mdec_stat) printchange(file, laststate.mdec_stat, state.mdec_stat, "MDEC", 8);
+
+        if (i == 0 || state.cd_status != laststate.cd_status) printchange(file, laststate.cd_status, state.cd_status, "CDS", 4);
+
+        if (i == 0 || state.timer[0] != laststate.timer[0]) printchange(file, laststate.timer[0], state.timer[0], "T0", 4);
+        if (i == 0 || state.timer[1] != laststate.timer[1]) printchange(file, laststate.timer[1], state.timer[1], "T1", 4);
+        if (i == 0 || state.timer[2] != laststate.timer[2]) printchange(file, laststate.timer[2], state.timer[2], "T2", 4);
+
+        if (i == 0 || state.debug8 != laststate.debug8) printchange(file, laststate.debug8, state.debug8, "D8", 2);
+        if (i == 0 || state.debug16 != laststate.debug16) printchange(file, laststate.debug16, state.debug16, "D16", 4);
+        if (i == 0 || state.debug32 != laststate.debug32) printchange(file, laststate.debug32, state.debug32, "D32", 8);
+
+        fputc('\n', file);
+    }
+    fclose(file);
+}
+
+void trace(State g_state)
+{
+    if (tracer.commands == 000000 && tracer.runmoretrace == -1)
+    {
+        //tracer.forceanalog = true;
+        //g_cdrom.RemoveMedia(false, true);
+
+        //tracer.GTETest();
+        //tracer.CDTest();
+        //tracer.MDECTest();
+        tracer.debug_SPUOutAll= true;
+        tracer.SPUTest();
+        //tracer.PadTest();
+        tracer.traclist_ptr = 0;
+        tracer.runmoretrace = 2014824448;
+        tracer.debug_outdiv = 1;
+        FILE* file = fopen("R:\\debug_duck_tty.txt", "w");
+        fclose(file);
+    }
+
+    if (tracer.runmoretrace > 0 && tracer.debug_outdivcnt == 0)
+    {
+        tracer.totalticks += g_state.lastticks;
+        if (tracer.traclist_ptr < tracer.Tracelist_Length) tracer.Tracelist[tracer.traclist_ptr].update(g_state);
+        tracer.traclist_ptr++;
+        tracer.runmoretrace = tracer.runmoretrace - 1;
+        if (tracer.runmoretrace == 0)
+        {
+            //tracer.VramOutWriteFile();
+            //tracer.GTEoutWriteFile();
+            //tracer.MDECOutWriteFile(true);
+            //tracer.CDOutWriteFile(true);
+            //tracer.PadOutWriteFile(true);
+            tracer.SPUOutWriteFile(true);
+            //tracer.trace_file_last();
+            int a = 5;
+        }
+    }
+    else if (tracer.runmoretrace > 0)
+    {
+        tracer.totalticks += g_state.lastticks;
+        tracer.sumticks += g_state.lastticks;
+    }
+
+    tracer.debug_outdivcnt = (tracer.debug_outdivcnt + 1) % tracer.debug_outdiv;
+
+    tracer.commands++;
+}
+
 template<PGXPMode pgxp_mode, bool debug>
 static void ExecuteImpl()
 {
@@ -1871,25 +2887,37 @@ static void ExecuteImpl()
   g_state.frame_done = false;
   while (!g_state.frame_done)
   {
-    TimingEvents::UpdateCPUDowncount();
+      g_state.afterCommand = false;
 
-    while (g_state.pending_ticks < g_state.downcount)
+    //TimingEvents::UpdateCPUDowncount();
+
+    //while (g_state.pending_ticks < g_state.downcount)
     {
+      if (tracer.commands == 0) CPU::g_state.pending_ticks = 0;
+      trace(g_state);
+      tracer.isException = false;
+      tracer.isInterrupt = false;
+      g_gpu->m_pending_command_ticks_last = 0;
+      g_mdec.hadTranfer = false;
+
+      //if (tracer.commands == 10) { tracer.overwriteButtons = true; tracer.overwriteByte0 = 0xFF; tracer.overwriteByte1 = 0xBF; } // cross
+      //if (tracer.commands == 100000) { tracer.overwriteButtons = true; tracer.overwriteByte0 = 0xFF; tracer.overwriteByte1 = 0xFF; } // cross
+      //if (tracer.commands == 1000000) { tracer.overwriteButtons = true; tracer.overwriteByte0 = 0xFE; tracer.overwriteByte1 = 0xFF; } // select
+
+      if (tracer.traclist_ptr == 715962)
+      //if (tracer.traclist_ptr == 0x25c5c)
+      {
+        int xx = 0;
+
+        //std::unique_ptr<ByteStream> stream = FileSystem::OpenFile("C:\\Projekte\\psx\\duckstation\\states\\state.sav", BYTESTREAM_OPEN_CREATE | BYTESTREAM_OPEN_WRITE | BYTESTREAM_OPEN_TRUNCATE | BYTESTREAM_OPEN_ATOMIC_UPDATE | BYTESTREAM_OPEN_STREAMED);
+        //System::SaveState(stream.get());
+        //stream->Commit();
+      }
+
       if (HasPendingInterrupt() && !g_state.interrupt_delay)
         DispatchInterrupt();
 
-      if constexpr (debug)
-      {
-        Cop0ExecutionBreakpointCheck();
-
-        if (BreakpointCheck())
-        {
-          // continue is measurably faster than break on msvc for some reason
-          continue;
-        }
-      }
-
-      g_state.interrupt_delay = false;
+      if (g_state.interrupt_delay > 0) g_state.interrupt_delay--;
       g_state.pending_ticks++;
 
       // now executing the instruction we previously fetched
@@ -1903,26 +2931,18 @@ static void ExecuteImpl()
 
       // fetch the next instruction - even if this fails, it'll still refetch on the flush so we can continue
       if (!FetchInstruction())
-        continue;
-
-      // trace functionality
-      if constexpr (debug)
       {
-        if (s_trace_to_log)
-          LogInstruction(g_state.current_instruction.bits, g_state.current_instruction_pc, &g_state.regs);
+          tracer.commands--;
+          tracer.totalticks--;
+          if (tracer.debug_outdivcnt == 0) tracer.traclist_ptr--;
+          else tracer.debug_outdivcnt--;
+          g_state.pending_ticks--;
+          continue;
       }
-
-#if 0 // GTE flag test debugging
-      if (g_state.m_current_instruction_pc == 0x8002cdf4)
-      {
-        if (g_state.m_regs.v1 != g_state.m_regs.v0)
-          printf("Got %08X Expected? %08X\n", g_state.m_regs.v1, g_state.m_regs.v0);
-      }
-#endif
 
       // execute the instruction we previously fetched
       ExecuteInstruction<pgxp_mode, debug>();
-
+      g_state.afterCommand = true;
       // next load delay
       UpdateLoadDelay();
     }

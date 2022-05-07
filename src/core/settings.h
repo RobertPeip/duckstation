@@ -172,7 +172,8 @@ struct Settings
   TickCount dma_max_slice_ticks = 1000;
   TickCount dma_halt_ticks = 100;
   u32 gpu_fifo_size = 128;
-  TickCount gpu_max_run_ahead = 128;
+  //TickCount gpu_max_run_ahead = 128;
+  TickCount gpu_max_run_ahead = 0;
 
   struct DebugSettings
   {
@@ -283,7 +284,8 @@ struct Settings
     DEFAULT_DMA_MAX_SLICE_TICKS = 1000,
     DEFAULT_DMA_HALT_TICKS = 100,
     DEFAULT_GPU_FIFO_SIZE = 16,
-    DEFAULT_GPU_MAX_RUN_AHEAD = 128,
+   // DEFAULT_GPU_MAX_RUN_AHEAD = 128,
+    DEFAULT_GPU_MAX_RUN_AHEAD = 0,
     DEFAULT_VRAM_WRITE_DUMP_WIDTH_THRESHOLD = 128,
     DEFAULT_VRAM_WRITE_DUMP_HEIGHT_THRESHOLD = 128,
   };

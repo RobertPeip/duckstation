@@ -3,6 +3,7 @@
 #include "common/fifo_queue.h"
 #include "common/rectangle.h"
 #include "gpu_types.h"
+#include "cpu_core.h"
 #include "timers.h"
 #include "types.h"
 #include <algorithm>
@@ -100,6 +101,15 @@ public:
   ALWAYS_INLINE void DMAWrite(u32 address, u32 value)
   {
     m_fifo.Push((ZeroExtend64(address) << 32) | ZeroExtend64(value));
+#ifdef VRAMFILEOUT
+    if (CPU::tracer.debug_VramOutCount < 1000000)
+    {
+        CPU::tracer.debug_VramOutTime[CPU::tracer.debug_VramOutCount] = CPU::tracer.commands;
+        CPU::tracer.debug_VramOutAddr[CPU::tracer.debug_VramOutCount] = value;
+        CPU::tracer.debug_VramOutType[CPU::tracer.debug_VramOutCount] = 2;
+        CPU::tracer.debug_VramOutCount++;
+    }
+#endif
   }
   void EndDMAWrite();
 
@@ -165,7 +175,7 @@ public:
   // Dumps raw VRAM to a file.
   bool DumpVRAMToFile(const char* filename);
 
-protected:
+public:
   TickCount CRTCTicksToSystemTicks(TickCount crtc_ticks, TickCount fractional_ticks) const;
   TickCount SystemTicksToCRTCTicks(TickCount sysclk_ticks, TickCount* fractional_ticks) const;
 
@@ -508,6 +518,8 @@ protected:
   BlitterState m_blitter_state = BlitterState::Idle;
   u32 m_command_total_words = 0;
   TickCount m_pending_command_ticks = 0;
+  TickCount m_pending_command_ticks_last = 0;
+  TickCount dmaGPUTicks = 0;
 
   /// GPUREAD value for non-VRAM-reads.
   u32 m_GPUREAD_latch = 0;

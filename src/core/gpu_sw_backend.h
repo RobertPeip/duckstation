@@ -1,5 +1,6 @@
 #pragma once
 #include "gpu_backend.h"
+#include "cpu_core.h"
 #include <array>
 #include <memory>
 #include <vector>
@@ -16,7 +17,31 @@ public:
   ALWAYS_INLINE_RELEASE u16 GetPixel(const u32 x, const u32 y) const { return m_vram[VRAM_WIDTH * y + x]; }
   ALWAYS_INLINE_RELEASE const u16* GetPixelPtr(const u32 x, const u32 y) const { return &m_vram[VRAM_WIDTH * y + x]; }
   ALWAYS_INLINE_RELEASE u16* GetPixelPtr(const u32 x, const u32 y) { return &m_vram[VRAM_WIDTH * y + x]; }
-  ALWAYS_INLINE_RELEASE void SetPixel(const u32 x, const u32 y, const u16 value) { m_vram[VRAM_WIDTH * y + x] = value; }
+  ALWAYS_INLINE_RELEASE void SetPixel(const u32 x, const u32 y, const u16 value) 
+  { 
+      m_vram[VRAM_WIDTH * y + x] = value; 
+#ifdef VRAMFILEOUT
+      if (CPU::tracer.debug_VramOutCount == 135388)
+      {
+          int a = 5;
+      }
+      ExportPixel(x, y, value);
+#endif
+  }
+
+  ALWAYS_INLINE_RELEASE void ExportPixel(const u32 x, const u32 y, const u16 value)
+  {
+#ifdef VRAMPIXELOUT
+      if (CPU::tracer.debug_VramOutCount < 1000000)
+      {
+          CPU::tracer.debug_VramOutTime[CPU::tracer.debug_VramOutCount] = CPU::tracer.commands;
+          CPU::tracer.debug_VramOutAddr[CPU::tracer.debug_VramOutCount] = (VRAM_WIDTH * y + x) * 2;
+          CPU::tracer.debug_VramOutData[CPU::tracer.debug_VramOutCount] = value;
+          CPU::tracer.debug_VramOutType[CPU::tracer.debug_VramOutCount] = 1;
+          CPU::tracer.debug_VramOutCount++;
+      }
+#endif
+  }
 
   // this is actually (31 * 255) >> 4) == 494, but to simplify addressing we use the next power of two (512)
   static constexpr u32 DITHER_LUT_SIZE = 512;

@@ -37,7 +37,6 @@ public:
 
   ALWAYS_INLINE bool IsTransmitting() const { return m_state != State::Idle; }
 
-private:
   static constexpr u32 NUM_SLOTS = 2;
 
   enum class State : u32

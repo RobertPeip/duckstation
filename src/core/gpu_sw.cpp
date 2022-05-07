@@ -249,6 +249,11 @@ void GPU_SW::CopyOut15Bit(u32 src_x, u32 src_y, u32 width, u32 height, u32 field
   const u8 interlaced_shift = BoolToUInt8(interlaced);
   const u8 interleaved_shift = BoolToUInt8(interleaved);
 
+  if (src_x != 3 || src_y != 0xE)
+  {
+      int a = 5;
+  }
+
   // Fast path when not wrapping around.
   if ((src_x + width) <= VRAM_WIDTH && (src_y + height) <= VRAM_HEIGHT)
   {
@@ -789,8 +794,8 @@ void GPU_SW::DispatchRenderCommand()
           cmd->vertices[i].x = m_drawing_offset.x + vp.x;
           cmd->vertices[i].y = m_drawing_offset.y + vp.y;
 
-          const auto [min_x, max_x] = MinMax(cmd->vertices[i - 1].x, cmd->vertices[i].y);
-          const auto [min_y, max_y] = MinMax(cmd->vertices[i - 1].x, cmd->vertices[i].y);
+          const auto [min_x, max_x] = MinMax(cmd->vertices[i - 1].x, cmd->vertices[i].x);
+          const auto [min_y, max_y] = MinMax(cmd->vertices[i - 1].y, cmd->vertices[i].y);
           if ((max_x - min_x) >= MAX_PRIMITIVE_WIDTH || (max_y - min_y) >= MAX_PRIMITIVE_HEIGHT)
           {
             Log_DebugPrintf("Culling too-large line: %d,%d - %d,%d", cmd->vertices[i - 1].x, cmd->vertices[i - 1].y,
@@ -807,6 +812,7 @@ void GPU_SW::DispatchRenderCommand()
 
             // cmd->bounds.Include(Truncate16(clip_left), Truncate16(clip_right), Truncate16(clip_top),
             // Truncate16(clip_bottom));
+
             AddDrawLineTicks(clip_right - clip_left, clip_bottom - clip_top, m_render_command.shading_enable);
           }
         }

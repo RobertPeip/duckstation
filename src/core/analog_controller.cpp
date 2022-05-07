@@ -5,6 +5,7 @@
 #include "host_interface.h"
 #include "settings.h"
 #include "system.h"
+#include "cpu_core.h"
 #include <cmath>
 Log_SetChannel(AnalogController);
 
@@ -221,11 +222,15 @@ float AnalogController::GetVibrationMotorStrength(u32 motor)
 
 void AnalogController::ResetTransferState()
 {
-  if (m_analog_toggle_queued)
-  {
-    ProcessAnalogModeToggle();
-    m_analog_toggle_queued = false;
-  }
+    if (CPU::tracer.forceanalog)
+    {
+        SetAnalogMode(true);
+    }
+    else if (m_analog_toggle_queued)
+    {
+        ProcessAnalogModeToggle();
+        m_analog_toggle_queued = false;
+    }
 
   m_command = Command::Idle;
   m_command_step = 0;
@@ -258,13 +263,13 @@ void AnalogController::ProcessAnalogModeToggle()
   }
   else
   {
-    SetAnalogMode(!m_analog_mode);
+      SetAnalogMode(!m_analog_mode);
 
-    // Manually toggling controller mode resets and disables rumble configuration
-    m_rumble_unlocked = false;
-    ResetRumbleConfig();
+      // Manually toggling controller mode resets and disables rumble configuration
+      m_rumble_unlocked = false;
+      ResetRumbleConfig();
 
-    // TODO: Mode switch detection (0x00 returned on certain commands instead of 0x5A)
+      // TODO: Mode switch detection (0x00 returned on certain commands instead of 0x5A)
   }
 }
 
@@ -373,6 +378,7 @@ bool AnalogController::Transfer(const u8 data_in, u8* data_out)
         Assert(m_command_step == 0);
         m_response_length = (GetResponseNumHalfwords() + 1) * 2;
         m_command = Command::ConfigModeSetMode;
+        m_configuration_mode_now = m_configuration_mode;
         m_tx_buffer = {GetIDByte(), GetStatusByte(), 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
       }
       else if (m_configuration_mode && data_in == 0x44)
@@ -514,7 +520,7 @@ bool AnalogController::Transfer(const u8 data_in, u8* data_out)
 
     case Command::ConfigModeSetMode:
     {
-      if (!m_configuration_mode)
+      if (!m_configuration_mode_now)
       {
         switch (m_command_step)
         {
@@ -565,7 +571,12 @@ bool AnalogController::Transfer(const u8 data_in, u8* data_out)
         }
       }
 
-      if (m_command_step == (static_cast<s32>(m_response_length) - 1))
+      // Some controller revisions will only change config mode state upon receiving the entire command sequence while others will set it immediately on receiving the xx byte.
+      // So while aborting the command sequence early (i.e. setting JOY_CTRL to 0 after sending xx, which some homebrew software does) may work for setting config mode state on some controllers, in practice this technique is undefined behavior and use should be avoided.
+      // padtest requires to switch even when break after 4th byte
+
+      if (m_command_step == 3)
+      //if (m_command_step == (static_cast<s32>(m_response_length) - 1))
       {
         m_rumble_unlocked = true;
         m_configuration_mode = (m_rx_buffer[2] == 1);

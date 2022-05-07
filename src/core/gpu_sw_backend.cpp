@@ -392,6 +392,12 @@ void GPU_SW_Backend::DrawSpan(const GPUBackendDrawPolygonCommand* cmd, s32 y, s3
 
     x++;
     AddIDeltas_DX<shading_enable, texture_enable>(ig, idl);
+
+    if (w == 1)
+    {
+        int a = 5;
+    }
+
   } while (--w > 0);
 }
 
@@ -527,9 +533,7 @@ void GPU_SW_Backend::DrawTriangle(const GPUBackendDrawPolygonCommand* cmd,
     tp->y_bound = vertices[2 ^ vp]->y;
     tp->x_coord[right_facing] = MakePolyXFP(vertices[1 ^ vp]->x);
     tp->x_step[right_facing] = bound_coord_ls;
-    tp->x_coord[!right_facing] =
-      base_coord + ((vertices[1 ^ vp]->y - vertices[0]->y) *
-                    base_step); // base_coord + ((vertices[1].y - vertices[0].y) * base_step);
+    tp->x_coord[!right_facing] = base_coord + ((vertices[1 ^ vp]->y - vertices[0]->y) * base_step); // base_coord + ((vertices[1].y - vertices[0].y) * base_step);
     tp->x_step[!right_facing] = base_step;
     tp->dec_mode = vp;
   }
@@ -821,6 +825,13 @@ void GPU_SW_Backend::UpdateVRAM(u32 x, u32 y, u32 width, u32 height, const void*
     u16* dst_ptr = &m_vram_ptr[y * VRAM_WIDTH + x];
     for (u32 yoffs = 0; yoffs < height; yoffs++)
     {
+#ifdef VRAMFILEOUT
+        for (int i = 0; i < width; i++)
+        {
+            u16 data = *(src_ptr + i);
+            ExportPixel(x + i, y, data);
+        }
+#endif
       std::copy_n(src_ptr, width, dst_ptr);
       src_ptr += width;
       dst_ptr += VRAM_WIDTH;
@@ -833,6 +844,8 @@ void GPU_SW_Backend::UpdateVRAM(u32 x, u32 y, u32 width, u32 height, const void*
     const u16 mask_and = params.GetMaskAND();
     const u16 mask_or = params.GetMaskOR();
 
+    u16 xpos = x;
+
     for (u32 row = 0; row < height;)
     {
       u16* dst_row_ptr = &m_vram_ptr[((y + row++) % VRAM_HEIGHT) * VRAM_WIDTH];
@@ -841,7 +854,14 @@ void GPU_SW_Backend::UpdateVRAM(u32 x, u32 y, u32 width, u32 height, const void*
         // TODO: Handle unaligned reads...
         u16* pixel_ptr = &dst_row_ptr[(x + col++) % VRAM_WIDTH];
         if (((*pixel_ptr) & mask_and) == 0)
-          *pixel_ptr = *(src_ptr++) | mask_or;
+        {
+            u16 data = *(src_ptr++) | mask_or;
+#ifdef VRAMFILEOUT
+            ExportPixel(xpos, y, data);
+            xpos = (xpos + 1) & 0x3FF;
+#endif
+            *pixel_ptr = data;
+        }
       }
     }
   }
@@ -899,7 +919,16 @@ void GPU_SW_Backend::CopyVRAM(u32 src_x, u32 src_y, u32 dst_x, u32 dst_y, u32 wi
         const u16 src_pixel = src_row_ptr[(src_x + static_cast<u32>(col)) % VRAM_WIDTH];
         u16* dst_pixel_ptr = &dst_row_ptr[(dst_x + static_cast<u32>(col)) % VRAM_WIDTH];
         if ((*dst_pixel_ptr & mask_and) == 0)
-          *dst_pixel_ptr = src_pixel | mask_or;
+        {
+            *dst_pixel_ptr = src_pixel | mask_or;
+#ifdef VRAMFILEOUT
+            if (CPU::tracer.debug_VramOutCount == 135388)
+            {
+                int a = 5;
+            }
+            ExportPixel((dst_x + col) % VRAM_WIDTH, (dst_y + row) % VRAM_HEIGHT, src_pixel | mask_or);
+#endif
+        }
       }
     }
   }
@@ -915,7 +944,16 @@ void GPU_SW_Backend::CopyVRAM(u32 src_x, u32 src_y, u32 dst_x, u32 dst_y, u32 wi
         const u16 src_pixel = src_row_ptr[(src_x + col) % VRAM_WIDTH];
         u16* dst_pixel_ptr = &dst_row_ptr[(dst_x + col) % VRAM_WIDTH];
         if ((*dst_pixel_ptr & mask_and) == 0)
-          *dst_pixel_ptr = src_pixel | mask_or;
+        {
+            *dst_pixel_ptr = src_pixel | mask_or;
+#ifdef VRAMFILEOUT
+            if (CPU::tracer.debug_VramOutCount == 135388)
+            {
+                int a = 5;
+            }
+            ExportPixel((dst_x + col) % VRAM_WIDTH, (dst_y + row) % VRAM_HEIGHT, src_pixel | mask_or);
+#endif
+        }
       }
     }
   }

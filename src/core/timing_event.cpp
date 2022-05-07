@@ -20,6 +20,11 @@ u32 GetGlobalTickCounter()
   return s_global_tick_counter;
 }
 
+void AddGlobalTickCounter()
+{
+    s_global_tick_counter++;
+}
+
 void Initialize()
 {
   Reset();
@@ -271,10 +276,18 @@ void RunEvents()
 
     // Apply downcount to all events.
     // This will result in a negative downcount for those events which are late.
+    bool ordered = true;
+    TickCount first = s_active_events_head->m_downcount;
     for (TimingEvent* event = s_active_events_head; event; event = event->next)
     {
-      event->m_downcount -= time;
-      event->m_time_since_last_run += time;
+        if (event->m_downcount < first) ordered = false;
+        event->m_downcount -= time;
+        event->m_time_since_last_run += time;
+    }
+
+    if (!ordered)
+    {
+        SortEvents();
     }
 
     // Now we can actually run the callbacks.
@@ -293,12 +306,16 @@ void RunEvents()
       // The cycles_late is only an indicator, it doesn't modify the cycles to execute.
       event->m_callback(event->m_callback_param, ticks_to_execute, ticks_late);
       if (event->m_active)
-        SortEvent(event);
+          SortEvent(event);
     }
+
   }
 
   s_current_event = nullptr;
   UpdateCPUDowncount();
+
+  CPU::tracer.nextTimingEventDelay = s_active_events_head->m_downcount;
+  
 }
 
 bool DoState(StateWrapper& sw)

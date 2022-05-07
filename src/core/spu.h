@@ -60,7 +60,6 @@ public:
   /// Change output stream - used for runahead.
   ALWAYS_INLINE void SetAudioStream(AudioStream* stream) { m_audio_stream = stream; }
 
-private:
   static constexpr u32 SPU_BASE = 0x1F801C00;
   static constexpr u32 NUM_VOICES = 24;
   static constexpr u32 NUM_VOICE_REGISTERS = 8;
@@ -287,35 +286,35 @@ private:
 
   struct ReverbRegisters
   {
-    s16 vLOUT;
-    s16 vROUT;
-    u16 mBASE;
+    s16 vLOUT; // 1F801D84h spu   vLOUT   volume  Reverb Output Volume Left
+    s16 vROUT; // 1F801D86h spu   vROUT   volume  Reverb Output Volume Right
+    u16 mBASE; // 1F801DA2h spu   mBASE   base    Reverb Work Area Start Address in Sound RAM
 
     union
     {
       struct
       {
-        u16 FB_SRC_A;
-        u16 FB_SRC_B;
-        s16 IIR_ALPHA;
-        s16 ACC_COEF_A;
-        s16 ACC_COEF_B;
-        s16 ACC_COEF_C;
-        s16 ACC_COEF_D;
-        s16 IIR_COEF;
-        s16 FB_ALPHA;
-        s16 FB_X;
-        u16 IIR_DEST_A[2];
-        u16 ACC_SRC_A[2];
-        u16 ACC_SRC_B[2];
-        u16 IIR_SRC_A[2];
-        u16 IIR_DEST_B[2];
-        u16 ACC_SRC_C[2];
-        u16 ACC_SRC_D[2];
-        u16 IIR_SRC_B[2];
-        u16 MIX_DEST_A[2];
-        u16 MIX_DEST_B[2];
-        s16 IN_COEF[2];
+        u16 FB_SRC_A;       // 1F801DC0h rev00 dAPF1   disp    Reverb APF Offset 1
+        u16 FB_SRC_B;       // 1F801DC2h rev01 dAPF2   disp    Reverb APF Offset 2
+        s16 IIR_ALPHA;      // 1F801DC4h rev02 vIIR    volume  Reverb Reflection Volume 1
+        s16 ACC_COEF_A;     // 1F801DC6h rev03 vCOMB1  volume  Reverb Comb Volume 1
+        s16 ACC_COEF_B;     // 1F801DC8h rev04 vCOMB2  volume  Reverb Comb Volume 2
+        s16 ACC_COEF_C;     // 1F801DCAh rev05 vCOMB3  volume  Reverb Comb Volume 3
+        s16 ACC_COEF_D;     // 1F801DCCh rev06 vCOMB4  volume  Reverb Comb Volume 4
+        s16 IIR_COEF;       // 1F801DCEh rev07 vWALL   volume  Reverb Reflection Volume 2
+        s16 FB_ALPHA;       // 1F801DD0h rev08 vAPF1   volume  Reverb APF Volume 1
+        s16 FB_X;           // 1F801DD2h rev09 vAPF2   volume  Reverb APF Volume 2
+        u16 IIR_DEST_A[2];  // 1F801DD4h rev0A mLSAME  src / dst Reverb Same Side Reflection Address 1 Left + 1F801DD6h rev0B mRSAME  src / dst Reverb Same Side Reflection Address 1 Right
+        u16 ACC_SRC_A[2];   // 1F801DD8h rev0C mLCOMB1 src     Reverb Comb Address 1 Left + 1F801DDAh rev0D mRCOMB1 src     Reverb Comb Address 1 Right
+        u16 ACC_SRC_B[2];   // 1F801DDCh rev0E mLCOMB2 src     Reverb Comb Address 2 Left + 1F801DDEh rev0F mRCOMB2 src     Reverb Comb Address 2 Right
+        u16 IIR_SRC_A[2];   // 1F801DE0h rev10 dLSAME  src     Reverb Same Side Reflection Address 2 Left + 1F801DE2h rev11 dRSAME  src     Reverb Same Side Reflection Address 2 Right
+        u16 IIR_DEST_B[2];  // 1F801DE4h rev12 mLDIFF  src / dst Reverb Different Side Reflect Address 1 Left + 1F801DE6h rev13 mRDIFF  src / dst Reverb Different Side Reflect Address 1 Right
+        u16 ACC_SRC_C[2];   // 1F801DE8h rev14 mLCOMB3 src     Reverb Comb Address 3 Left + 1F801DEAh rev15 mRCOMB3 src     Reverb Comb Address 3 Right
+        u16 ACC_SRC_D[2];   // 1F801DECh rev16 mLCOMB4 src     Reverb Comb Address 4 Left + 1F801DEEh rev17 mRCOMB4 src     Reverb Comb Address 4 Right
+        u16 IIR_SRC_B[2];   // 1F801DF0h rev18 dLDIFF  src     Reverb Different Side Reflect Address 2 Left + 1F801DF2h rev19 dRDIFF  src     Reverb Different Side Reflect Address 2 Right
+        u16 MIX_DEST_A[2];  // 1F801DF4h rev1A mLAPF1  src / dst Reverb APF Address 1 Left + 1F801DF6h rev1B mRAPF1  src / dst Reverb APF Address 1 Right
+        u16 MIX_DEST_B[2];  // 1F801DF8h rev1C mLAPF2  src / dst Reverb APF Address 2 Left + 1F801DFAh rev1D mRAPF2  src / dst Reverb APF Address 2 Right
+        s16 IN_COEF[2];     // 1F801DFCh rev1E vLIN    volume  Reverb Input Volume Left + 1F801DFEh rev1F vRIN    volume  Reverb Input Volume Right
       };
 
       u16 rev[NUM_REVERB_REGS];

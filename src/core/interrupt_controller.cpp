@@ -36,6 +36,12 @@ void InterruptController::InterruptRequest(IRQ irq)
   const u32 bit = (u32(1) << static_cast<u32>(irq));
   m_interrupt_status_register |= bit;
   UpdateCPUInterruptRequest();
+  if (irq == InterruptController::IRQ::DMA)
+  {
+      if (CPU::g_state.afterCommand && CPU::g_state.slowDMAIRQ) CPU::g_state.interrupt_delay = 3;
+      else CPU::g_state.interrupt_delay = 2;
+  }
+  if (irq == InterruptController::IRQ::CDROM) CPU::g_state.interrupt_delay = 2;
 }
 
 u32 InterruptController::ReadRegister(u32 offset)
@@ -73,6 +79,7 @@ void InterruptController::WriteRegister(u32 offset, u32 value)
       Log_DebugPrintf("Interrupt mask <- 0x%08X", value);
       m_interrupt_mask_register = value & REGISTER_WRITE_MASK;
       UpdateCPUInterruptRequest();
+      if (CPU::g_state.interrupt_delay == 1) CPU::g_state.interrupt_delay = 2;
     }
     break;
 

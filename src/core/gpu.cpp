@@ -12,6 +12,7 @@
 #include "stb_image_write.h"
 #include "system.h"
 #include "timers.h"
+#include "cpu_core.h"
 #include <cmath>
 #ifdef WITH_IMGUI
 #include "imgui.h"
@@ -40,7 +41,8 @@ bool GPU::Initialize(HostDisplay* host_display)
     [](void* param, TickCount ticks, TickCount ticks_late) { static_cast<GPU*>(param)->CommandTickEvent(ticks); }, this,
     true);
   m_fifo_size = g_settings.gpu_fifo_size;
-  m_max_run_ahead = g_settings.gpu_max_run_ahead;
+  //m_max_run_ahead = g_settings.gpu_max_run_ahead;
+  m_max_run_ahead = 0;
   m_console_is_pal = System::IsPALRegion();
   UpdateCRTCConfig();
   return true;
@@ -332,10 +334,14 @@ u32 GPU::ReadRegister(u32 offset)
     {
       // code can be dependent on the odd/even bit, so update the GPU state when reading.
       // we can mitigate this slightly by only updating when the raster is actually hitting a new line
+      
+      // was active, commented out to prevent timing hack
+      /*
       if (IsCRTCScanlinePending())
         SynchronizeCRTC();
       if (IsCommandCompletionPending())
         m_command_tick_event->InvokeEarly();
+      */
 
       return m_GPUSTAT.bits;
     }
@@ -351,6 +357,19 @@ void GPU::WriteRegister(u32 offset, u32 value)
   switch (offset)
   {
     case 0x00:
+      if (value == 0xa306a706)
+      {
+          int a = 5;
+      }
+#ifdef VRAMFILEOUT
+      if (CPU::tracer.debug_VramOutCount < 1000000)
+      {
+          CPU::tracer.debug_VramOutTime[CPU::tracer.debug_VramOutCount] = CPU::tracer.commands;
+          CPU::tracer.debug_VramOutAddr[CPU::tracer.debug_VramOutCount] = value;
+          CPU::tracer.debug_VramOutType[CPU::tracer.debug_VramOutCount] = 2;
+          CPU::tracer.debug_VramOutCount++;
+      }
+#endif
       m_fifo.Push(value);
       ExecuteCommands();
       UpdateCommandTickEvent();
@@ -423,7 +442,7 @@ TickCount GPU::SystemTicksToCRTCTicks(TickCount sysclk_ticks, TickCount* fractio
   mul += u64(*fractional_ticks);
 
   const TickCount ticks = static_cast<TickCount>(mul / u64(451584));
-  *fractional_ticks = static_cast<TickCount>(mul % u64(451584));
+  *fractional_ticks = 0; //static_cast<TickCount>(mul % u64(451584));
   return ticks;
 }
 
@@ -737,24 +756,24 @@ TickCount GPU::GetPendingCommandTicks() const
 void GPU::UpdateCRTCTickEvent()
 {
   // figure out how many GPU ticks until the next vblank or event
-  TickCount lines_until_event;
-  if (g_timers.IsSyncEnabled(HBLANK_TIMER_INDEX))
-  {
-    // when the timer sync is enabled we need to sync at vblank start and end
-    lines_until_event =
-      (m_crtc_state.current_scanline >= m_crtc_state.vertical_display_end) ?
-        (m_crtc_state.vertical_total - m_crtc_state.current_scanline + m_crtc_state.vertical_display_start) :
-        (m_crtc_state.vertical_display_end - m_crtc_state.current_scanline);
-  }
-  else
-  {
-    lines_until_event =
-      (m_crtc_state.current_scanline >= m_crtc_state.vertical_display_end ?
-         (m_crtc_state.vertical_total - m_crtc_state.current_scanline + m_crtc_state.vertical_display_end) :
-         (m_crtc_state.vertical_display_end - m_crtc_state.current_scanline));
-  }
-  if (g_timers.IsExternalIRQEnabled(HBLANK_TIMER_INDEX))
-    lines_until_event = std::min(lines_until_event, g_timers.GetTicksUntilIRQ(HBLANK_TIMER_INDEX));
+  TickCount lines_until_event = 1;
+  //if (g_timers.IsSyncEnabled(HBLANK_TIMER_INDEX))
+  //{
+  //  // when the timer sync is enabled we need to sync at vblank start and end
+  //  lines_until_event =
+  //    (m_crtc_state.current_scanline >= m_crtc_state.vertical_display_end) ?
+  //      (m_crtc_state.vertical_total - m_crtc_state.current_scanline + m_crtc_state.vertical_display_start) :
+  //      (m_crtc_state.vertical_display_end - m_crtc_state.current_scanline);
+  //}
+  //else
+  //{
+  //  lines_until_event =
+  //    (m_crtc_state.current_scanline >= m_crtc_state.vertical_display_end ?
+  //       (m_crtc_state.vertical_total - m_crtc_state.current_scanline + m_crtc_state.vertical_display_end) :
+  //       (m_crtc_state.vertical_display_end - m_crtc_state.current_scanline));
+  //}
+  //if (g_timers.IsExternalIRQEnabled(HBLANK_TIMER_INDEX))
+  //  lines_until_event = std::min(lines_until_event, g_timers.GetTicksUntilIRQ(HBLANK_TIMER_INDEX));
 
   TickCount ticks_until_event =
     lines_until_event * m_crtc_state.horizontal_total - m_crtc_state.current_tick_in_scanline;
@@ -774,6 +793,13 @@ void GPU::UpdateCRTCTickEvent()
 #endif
 
   m_crtc_tick_event->Schedule(CRTCTicksToSystemTicks(ticks_until_event, m_crtc_state.fractional_ticks));
+
+  if (CPU::g_state.afterCommand)
+  {
+      const TickCount pending_ticks = CPU::GetPendingTicks();
+      if (pending_ticks > 0)
+         m_crtc_tick_event->m_downcount -= pending_ticks;
+  }
 }
 
 bool GPU::IsCRTCScanlinePending() const
@@ -819,6 +845,7 @@ void GPU::CRTCTickEvent(TickCount ticks)
 
   u32 lines_to_draw = m_crtc_state.current_tick_in_scanline / m_crtc_state.horizontal_total;
   m_crtc_state.current_tick_in_scanline %= m_crtc_state.horizontal_total;
+  if (m_crtc_state.current_tick_in_scanline == 1) m_crtc_state.current_tick_in_scanline = 0;
 #if 0
   Log_WarningPrintf("Old line: %u, new line: %u, drawing %u", m_crtc_state.current_scanline,
                     m_crtc_state.current_scanline + lines_to_draw, lines_to_draw);
@@ -827,11 +854,17 @@ void GPU::CRTCTickEvent(TickCount ticks)
   const bool old_hblank = m_crtc_state.in_hblank;
   const bool new_hblank = (m_crtc_state.current_tick_in_scanline >= m_crtc_state.horizontal_sync_start);
   m_crtc_state.in_hblank = new_hblank;
+
   if (g_timers.IsUsingExternalClock(HBLANK_TIMER_INDEX))
   {
     const u32 hblank_timer_ticks = BoolToUInt32(!old_hblank) + BoolToUInt32(new_hblank) + (lines_to_draw - 1);
     g_timers.AddTicks(HBLANK_TIMER_INDEX, static_cast<TickCount>(hblank_timer_ticks));
   }
+
+  if (m_crtc_state.current_scanline == 0)
+  {
+    int a = 5;
+  }   
 
   while (lines_to_draw > 0)
   {
@@ -924,6 +957,11 @@ void GPU::CommandTickEvent(TickCount ticks)
   if (m_pending_command_ticks <= 0)
     m_pending_command_ticks = 0;
   else
+  {
+      const TickCount pending_ticks = CPU::GetPendingTicks();
+      if (pending_ticks > 0)
+          m_pending_command_ticks -= (pending_ticks * 2); // coming most likely from inbetween DMA
+  }
     m_command_tick_event->SetIntervalAndSchedule(GPUTicksToSystemTicks(m_pending_command_ticks));
 }
 
@@ -1022,8 +1060,8 @@ void GPU::WriteGP1(u32 value)
     case 0x01: // Clear FIFO
     {
       Log_DebugPrintf("GP1 clear FIFO");
-      m_command_tick_event->InvokeEarly();
-      SynchronizeCRTC();
+      //m_command_tick_event->InvokeEarly();
+      //SynchronizeCRTC();
 
       // flush partial writes
       if (m_blitter_state == BlitterState::WritingVRAM)
@@ -1053,7 +1091,7 @@ void GPU::WriteGP1(u32 value)
     {
       const bool disable = ConvertToBoolUnchecked(value & 0x01);
       Log_DebugPrintf("Display %s", disable ? "disabled" : "enabled");
-      SynchronizeCRTC();
+      //SynchronizeCRTC();
 
       if (!m_GPUSTAT.display_disable && disable && m_GPUSTAT.vertical_interlace && !m_force_progressive_scan)
         ClearDisplay();
@@ -1081,7 +1119,7 @@ void GPU::WriteGP1(u32 value)
       System::IncrementInternalFrameNumber();
       if (m_crtc_state.regs.display_address_start != new_value)
       {
-        SynchronizeCRTC();
+        //SynchronizeCRTC();
         m_crtc_state.regs.display_address_start = new_value;
         UpdateCRTCDisplayParameters();
       }

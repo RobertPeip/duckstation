@@ -12,6 +12,9 @@ class TimingEvent;
 class DMA
 {
 public:
+  bool isDMA;
+  uint32_t DMATicks;
+
   enum : u32
   {
     NUM_CHANNELS = 7
@@ -47,7 +50,6 @@ public:
 
   void DrawDebugStateWindow();
 
-private:
   static constexpr PhysicalMemoryAddress BASE_ADDRESS_MASK = UINT32_C(0x00FFFFFF);
   static constexpr PhysicalMemoryAddress ADDRESS_MASK = UINT32_C(0x001FFFFC);
 
@@ -69,7 +71,7 @@ private:
   // returns false if the DMA should now be halted
   TickCount GetTransferSliceTicks() const;
   TickCount GetTransferHaltTicks() const;
-  bool TransferChannel(Channel channel);
+  bool TransferChannel(Channel channel, bool first);
   void HaltTransfer(TickCount duration);
   void UnhaltTransfer(TickCount ticks);
 

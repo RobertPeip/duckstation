@@ -405,6 +405,13 @@ bool CommonHostInterface::ParseCommandLineParameters(int argc, char* argv[],
     boot_filename += argv[i];
   }
 
+  boot_filename = "padtest.exe";
+
+  force_fast_boot = true;
+
+  
+  state_filename = "test.sav";
+
   if (state_index.has_value() || !boot_filename.empty() || !state_filename.empty())
   {
     // init user directory early since we need it for save states

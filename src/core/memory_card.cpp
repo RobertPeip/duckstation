@@ -6,6 +6,7 @@
 #include "common/string_util.h"
 #include "host_interface.h"
 #include "system.h"
+#include "cpu_core.h"
 #include <cstdio>
 Log_SetChannel(MemoryCard);
 
@@ -48,6 +49,11 @@ void MemoryCard::Reset()
   ResetTransferState();
   SaveIfChanged(true);
   m_FLAG.no_write_yet = true;
+
+  for (int i = 0; i < 131072; i++)
+  {
+      m_data[i] = 0x00;
+  }
 }
 
 bool MemoryCard::DoState(StateWrapper& sw)
@@ -132,6 +138,7 @@ bool MemoryCard::Transfer(const u8 data_in, u8* data_out)
       const u8 bits = m_data[ZeroExtend32(m_address) * MemoryCardImage::FRAME_SIZE + m_sector_offset];
       if (m_sector_offset == 0)
       {
+        CPU::tracer.PadOutCapture(0, m_address, 6);
         Log_DevPrintf("Reading memory card sector %u", ZeroExtend32(m_address));
         m_checksum = Truncate8(m_address >> 8) ^ Truncate8(m_address) ^ bits;
       }
@@ -139,6 +146,8 @@ bool MemoryCard::Transfer(const u8 data_in, u8* data_out)
       {
         m_checksum ^= bits;
       }
+
+      CPU::tracer.PadOutCapture(bits, 0, 7);
 
       *data_out = bits;
       ack = true;

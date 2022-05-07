@@ -44,7 +44,6 @@ public:
   u32 ReadRegister(u32 offset);
   void WriteRegister(u32 offset, u32 value);
 
-private:
   static constexpr u32 NUM_TIMERS = 3;
 
   enum class SyncMode : u8

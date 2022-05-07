@@ -22,7 +22,6 @@ public:
   void Reset(bool clear_vram) override;
   void UpdateSettings() override;
 
-protected:
   void ReadVRAM(u32 x, u32 y, u32 width, u32 height) override;
   void FillVRAM(u32 x, u32 y, u32 width, u32 height, u32 color) override;
   void UpdateVRAM(u32 x, u32 y, u32 width, u32 height, const void* data, bool set_mask, bool check_mask) override;

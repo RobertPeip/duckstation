@@ -2,6 +2,7 @@
 #include "common/bitfield.h"
 #include "cpu_types.h"
 #include "gte_types.h"
+#include "cpu_core.h"
 #include "types.h"
 #include <array>
 #include <optional>
@@ -46,6 +47,7 @@ union CacheControl
 struct State
 {
   // ticks the CPU has executed
+  TickCount lastticks = 0;
   TickCount pending_ticks = 0;
   TickCount downcount = 0;
 
@@ -61,7 +63,7 @@ struct State
   bool next_instruction_is_branch_delay_slot = false;
   bool branch_was_taken = false;
   bool exception_raised = false;
-  bool interrupt_delay = false;
+  u8 interrupt_delay = false;
   bool frame_done = false;
 
   // load delays
@@ -79,6 +81,9 @@ struct State
   bool use_debug_dispatcher = false;
 
   u8* fastmem_base = nullptr;
+
+  bool afterCommand;
+  bool slowDMAIRQ;
 
   // data cache (used as scratchpad)
   std::array<u8, DCACHE_SIZE> dcache = {};
@@ -118,6 +123,7 @@ ALWAYS_INLINE TickCount GetPendingTicks()
 }
 ALWAYS_INLINE void ResetPendingTicks()
 {
+  g_state.lastticks = g_state.pending_ticks;
   g_state.pending_ticks = 0;
 }
 ALWAYS_INLINE void AddPendingTicks(TickCount ticks)
@@ -186,5 +192,158 @@ bool AddStepOverBreakpoint();
 bool AddStepOutBreakpoint(u32 max_instructions_to_search = 1000);
 
 extern bool TRACE_EXECUTION;
+
+// ############################## export
+
+class cpustate
+{
+public:
+  uint32_t ticks;
+  uint32_t newticks;
+  uint32_t regs[32];
+  uint32_t regs_hi;
+  uint32_t regs_lo;
+  uint32_t sr;  
+  uint32_t cause;  
+  uint32_t pc;  
+  uint32_t opcode; 
+
+  uint16_t irq;
+
+  uint16_t gpu_time;
+  uint16_t gpu_line;
+  uint32_t gpu_stat;
+  uint16_t fifocount;
+  uint16_t gpu_ticks;
+
+  uint32_t mdec_stat;
+
+  uint16_t cd_status;
+
+  uint16_t timer[3];
+
+  unsigned char debug8;
+  uint16_t debug16;
+  uint32_t debug32;
+
+  void update(State g_state);
+};
+
+class Tracer
+{
+public:
+  uint32_t totalticks = 0;
+  uint32_t sumticks = 0;
+
+  int startindex;
+
+  int additional_steps;
+  uint32_t commands;
+  uint32_t cyclenr;
+  bool tracenext;
+
+  const int Tracelist_Length = 2000000;
+  cpustate Tracelist[2000000];
+  int debug_outdivcnt = 0;
+  int debug_outdiv = 1;
+
+  int traclist_ptr;
+  int runmoretrace = -1;
+
+  bool isException;
+  bool isInterrupt;
+  uint32_t exceptionOpcode;
+
+  uint32_t nextTimingEventDelay;
+
+  bool overwriteButtons = false;
+  u8 overwriteByte0 = 0;
+  u8 overwriteByte1 = 0;
+  bool forceanalog = false;
+
+  void trace_file_last();
+
+//#define VRAMFILEOUT
+//#define VRAMPIXELOUT
+#ifdef VRAMFILEOUT
+  uint32_t debug_VramOutTime[1000000];
+  uint32_t debug_VramOutAddr[1000000];
+  uint16_t debug_VramOutData[1000000];
+  uint8_t debug_VramOutType[1000000];
+  uint32_t debug_VramOutCount;
+#endif
+  void VramOutWriteFile();
+
+//#define GTEFILEOUT
+#ifdef GTEFILEOUT
+  uint32_t debug_GTEOutTime[1000000];
+  uint8_t debug_GTEOutAddr[1000000];
+  uint32_t debug_GTEOutData[1000000];
+  uint8_t debug_GTEOutType[1000000];
+  uint32_t debug_GTEOutCount;
+  uint32_t debug_GTELast[64];
+#endif
+  void GTEoutRegCapture(uint8_t regtype);
+  void GTEoutCommandCapture(uint32_t command);
+  void GTEoutWriteFile();
+  void GTETest();
+
+//#define MDECFILEOUT
+#ifdef MDECFILEOUT
+  uint32_t debug_MDECOutTime[1000000];
+  uint8_t  debug_MDECOutAddr[1000000];
+  uint32_t debug_MDECOutData[1000000];
+  uint8_t  debug_MDECOutType[1000000];
+  uint32_t debug_MDECOutCount;
+#endif
+  void MDECOutCapture(uint8_t type, uint8_t addr, uint32_t data);
+  void MDECOutWriteFile(bool writeTest);
+  void MDECTest();
+
+//#define CDFILEOUT
+#ifdef CDFILEOUT
+#define CDFILEOUTMAX 1000000
+  uint32_t debug_CDOutTime[CDFILEOUTMAX];
+  uint8_t  debug_CDOutAddr[CDFILEOUTMAX];
+  uint32_t debug_CDOutData[CDFILEOUTMAX];
+  uint8_t  debug_CDOutType[CDFILEOUTMAX];
+  uint32_t debug_CDOutCount;
+  uint8_t  debug_XAOutType[1000000];
+  uint32_t debug_XAOutData[1000000];
+  uint32_t debug_XAOutCount;
+#endif
+  void CDOutCapture(uint8_t type, uint8_t addr, uint32_t data);
+  void XAOutCapture(uint8_t type, uint32_t data);
+  void CDOutWriteFile(bool writeTest);
+  void CDTest();
+
+//#define PADFILEOUT
+#ifdef PADFILEOUT
+  uint32_t debug_PadOutTime[1000000];
+  uint8_t  debug_PadOutAddr[1000000];
+  uint16_t debug_PadOutData[1000000];
+  uint8_t  debug_PadOutType[1000000];
+  uint32_t debug_PadOutCount;
+#endif
+  void PadOutCapture(uint8_t addr, uint16_t data, uint8_t type);
+  void PadOutWriteFile(bool writeTest);
+  void PadTest();
+
+#define SPUFILEOUT
+#ifdef SPUFILEOUT
+#define SPUFILEOUTMAX 5000000
+  uint32_t debug_SPUOutTime[SPUFILEOUTMAX];
+  uint16_t  debug_SPUOutAddr[SPUFILEOUTMAX];
+  uint16_t debug_SPUOutData[SPUFILEOUTMAX];
+  uint8_t  debug_SPUOutType[SPUFILEOUTMAX];
+  uint32_t debug_SPUOutCount;
+  bool debug_SPUOutAll = false;
+#endif
+  void SPUOutCapture(uint16_t addr, uint16_t data, uint8_t type, uint8_t timeadd);
+  void SPUOutWriteFile(bool writeTest);
+  void SPUTest();
+
+};
+extern Tracer tracer;
 
 } // namespace CPU

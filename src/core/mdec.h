@@ -29,7 +29,6 @@ public:
 
   void DrawDebugStateWindow();
 
-private:
   static constexpr u32 DATA_IN_FIFO_SIZE = 1024;
   static constexpr u32 DATA_OUT_FIFO_SIZE = 768;
   static constexpr u32 NUM_BLOCKS = 6;
@@ -146,6 +145,8 @@ private:
   std::unique_ptr<TimingEvent> m_block_copy_out_event;
 
   u32 m_total_blocks_decoded = 0;
+
+  bool hadTranfer;
 };
 
 extern MDEC g_mdec;

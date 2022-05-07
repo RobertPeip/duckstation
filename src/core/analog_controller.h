@@ -130,6 +130,7 @@ private:
   bool m_analog_locked = false;
   bool m_rumble_unlocked = false;
   bool m_configuration_mode = false;
+  bool m_configuration_mode_now = false;
 
   std::array<u8, static_cast<u8>(Axis::Count)> m_axis_state{};
 

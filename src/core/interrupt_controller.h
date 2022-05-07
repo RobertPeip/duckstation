@@ -42,7 +42,6 @@ public:
   u32 ReadRegister(u32 offset);
   void WriteRegister(u32 offset, u32 value);
 
-private:
   static constexpr u32 REGISTER_WRITE_MASK = (u32(1) << NUM_IRQS) - 1;
   static constexpr u32 DEFAULT_INTERRUPT_MASK = 0; //(u32(1) << NUM_IRQS) - 1;
 

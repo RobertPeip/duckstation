@@ -180,7 +180,7 @@ void DMA::WriteRegister(u32 offset, u32 value)
           SetRequest(static_cast<Channel>(channel_index), state.channel_control.start_trigger);
 
         if (CanTransferChannel(static_cast<Channel>(channel_index), ignore_halt))
-          TransferChannel(static_cast<Channel>(channel_index));
+          TransferChannel(static_cast<Channel>(channel_index), true);
         return;
       }
 
@@ -201,7 +201,7 @@ void DMA::WriteRegister(u32 offset, u32 value)
         {
           if (CanTransferChannel(static_cast<Channel>(i), false))
           {
-            if (!TransferChannel(static_cast<Channel>(i)))
+            if (!TransferChannel(static_cast<Channel>(i), false))
               break;
           }
         }
@@ -234,7 +234,7 @@ void DMA::SetRequest(Channel channel, bool request)
 
   cs.request = request;
   if (CanTransferChannel(channel, false))
-    TransferChannel(channel);
+    TransferChannel(channel, false);
 }
 
 bool DMA::CanTransferChannel(Channel channel, bool ignore_halt) const
@@ -286,8 +286,12 @@ TickCount DMA::GetTransferSliceTicks() const
                     SLICE_SIZE_WHEN_TRANSMITTING_PAD, m_max_slice_ticks);
   }
 #endif
-
+#ifdef ENDLESSDMA
+  return g_pad.IsTransmitting() ? SLICE_SIZE_WHEN_TRANSMITTING_PAD : 1000000;
+#else
   return g_pad.IsTransmitting() ? SLICE_SIZE_WHEN_TRANSMITTING_PAD : m_max_slice_ticks;
+#endif
+
 }
 
 TickCount DMA::GetTransferHaltTicks() const
@@ -295,8 +299,11 @@ TickCount DMA::GetTransferHaltTicks() const
   return g_pad.IsTransmitting() ? HALT_TICKS_WHEN_TRANSMITTING_PAD : m_halt_ticks;
 }
 
-bool DMA::TransferChannel(Channel channel)
+bool DMA::TransferChannel(Channel channel, bool first)
 {
+  DMATicks = 0;
+  CPU::g_state.slowDMAIRQ = true;
+
   ChannelState& cs = m_state[static_cast<u32>(channel)];
   const u32 mask = GetAddressMask();
 
@@ -321,7 +328,13 @@ bool DMA::TransferChannel(Channel channel)
       else
         used_ticks = TransferDeviceToMemory(channel, current_address & mask, increment, word_count);
 
-      CPU::AddPendingTicks(used_ticks);
+      used_ticks += 10;
+
+      if (channel != Channel::GPU)
+      {
+          CPU::AddPendingTicks(used_ticks);
+      }
+      DMATicks += used_ticks;
     }
     break;
 
@@ -338,32 +351,59 @@ bool DMA::TransferChannel(Channel channel)
 
       u8* ram_pointer = Bus::g_ram;
       TickCount remaining_ticks = GetTransferSliceTicks();
+      g_gpu->dmaGPUTicks = 0;
       while (cs.request && remaining_ticks > 0)
       {
         u32 header;
         std::memcpy(&header, &ram_pointer[current_address & mask], sizeof(header));
         CPU::AddPendingTicks(10);
+        DMATicks += 10;
         remaining_ticks -= 10;
 
         const u32 word_count = header >> 24;
         const u32 next_address = header & UINT32_C(0x00FFFFFF);
         Log_TracePrintf(" .. linked list entry at 0x%08X size=%u(%u words) next=0x%08X", current_address & mask,
                         word_count * UINT32_C(4), word_count, next_address);
+
+#ifdef VRAMFILEOUT
+        if (CPU::tracer.debug_VramOutCount < 1000000)
+        {
+            CPU::tracer.debug_VramOutTime[CPU::tracer.debug_VramOutCount] = next_address;
+            CPU::tracer.debug_VramOutAddr[CPU::tracer.debug_VramOutCount] = word_count;
+            CPU::tracer.debug_VramOutData[CPU::tracer.debug_VramOutCount] = DMATicks;
+            CPU::tracer.debug_VramOutType[CPU::tracer.debug_VramOutCount] = 3;
+            CPU::tracer.debug_VramOutCount++;
+        }
+#endif
+
         if (word_count > 0)
         {
           CPU::AddPendingTicks(5);
+          DMATicks += 5;
           remaining_ticks -= 5;
 
           const TickCount block_ticks =
             TransferMemoryToDevice(channel, (current_address + sizeof(header)) & mask, 4, word_count);
-          CPU::AddPendingTicks(block_ticks);
+          if (channel != Channel::GPU)
+          {
+              CPU::AddPendingTicks(block_ticks);
+          }
+          DMATicks += block_ticks;
           remaining_ticks -= block_ticks;
+        }
+        else if (next_address & UINT32_C(0x800000))
+        { 
+            CPU::AddPendingTicks(1);
+            DMATicks += 1;
+            remaining_ticks -= 1;
         }
 
         current_address = next_address;
         if (current_address & UINT32_C(0x800000))
           break;
       }
+
+      g_gpu->dmaGPUTicks = 0;
 
       cs.base_address = current_address;
 
@@ -395,6 +435,10 @@ bool DMA::TransferChannel(Channel channel)
       u32 blocks_remaining = cs.block_control.request.GetBlockCount();
       TickCount ticks_remaining = GetTransferSliceTicks();
 
+      CPU::AddPendingTicks(10);
+      DMATicks += 10;
+      ticks_remaining -= 10;
+
       if (copy_to_device)
       {
         do
@@ -402,7 +446,11 @@ bool DMA::TransferChannel(Channel channel)
           blocks_remaining--;
 
           const TickCount ticks = TransferMemoryToDevice(channel, current_address & mask, increment, block_size);
-          CPU::AddPendingTicks(ticks);
+          if (channel != Channel::GPU && channel != Channel::MDECin)
+          {
+              CPU::AddPendingTicks(ticks);
+          }
+          DMATicks += ticks;
           ticks_remaining -= ticks;
 
           current_address = (current_address + (increment * block_size));
@@ -416,7 +464,23 @@ bool DMA::TransferChannel(Channel channel)
 
           const TickCount ticks = TransferDeviceToMemory(channel, current_address & mask, increment, block_size);
           CPU::AddPendingTicks(ticks);
+          DMATicks += ticks;
           ticks_remaining -= ticks;
+
+          if (channel == Channel::MDECout)
+          {
+              if (g_mdec.m_data_out_fifo.IsEmpty())
+              {
+                  TickCount before = g_mdec.m_block_copy_out_event->m_downcount;
+                  g_mdec.Execute();
+                  TickCount after = g_mdec.m_block_copy_out_event->m_downcount;
+                  // due to mdec DMA in and out coming in nested calls, a input dma can be pending while output dma already is pushed, so initial cost of 10 must be subtracted
+                  if (g_mdec.hadTranfer && after > before)
+                      g_mdec.m_block_copy_out_event->m_downcount -= 10;
+                  if (!CPU::g_state.afterCommand && after > before)
+                      g_mdec.m_block_copy_out_event->m_downcount -= 1;
+              }
+          }
 
           current_address = (current_address + (increment * block_size));
         } while (cs.request && blocks_remaining > 0 && ticks_remaining > 0);
@@ -482,7 +546,7 @@ void DMA::UnhaltTransfer(TickCount ticks)
   {
     if (CanTransferChannel(static_cast<Channel>(i), false))
     {
-      if (!TransferChannel(static_cast<Channel>(i)))
+      if (!TransferChannel(static_cast<Channel>(i), false))
         return;
     }
   }
@@ -524,18 +588,36 @@ TickCount DMA::TransferMemoryToDevice(Channel channel, u32 address, u32 incremen
           std::memcpy(&value, &ram_pointer[address], sizeof(u32));
           g_gpu->DMAWrite(address, value);
           address = (address + increment) & mask;
+          g_gpu->EndDMAWrite();
+          g_gpu->dmaGPUTicks++;
+          CPU::AddPendingTicks(1);
         }
-        g_gpu->EndDMAWrite();
       }
     }
     break;
 
     case Channel::SPU:
+      CPU::g_state.slowDMAIRQ = false;
       g_spu.DMAWrite(src_pointer, word_count);
       break;
 
     case Channel::MDECin:
-      g_mdec.DMAWrite(src_pointer, word_count);
+    {
+        //g_mdec.DMAWrite(src_pointer, word_count);
+        u8* ram_pointer = Bus::g_ram;
+        g_mdec.hadTranfer = true;
+        for (u32 i = 0; i < word_count; i++)
+        {
+            u32 value;
+            std::memcpy(&value, &ram_pointer[address], sizeof(u32));
+#ifdef MDECFILEOUT
+            CPU::tracer.MDECOutCapture(10, 0, value);
+#endif
+            g_mdec.WriteCommandRegister(value);
+            address = (address + increment) & mask;
+            CPU::AddPendingTicks(1);
+        }
+    }
       break;
 
     case Channel::CDROM:

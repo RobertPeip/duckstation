@@ -340,6 +340,11 @@ void WriteRegister(u32 index, u32 value)
     }
     break;
   }
+
+#ifdef GTEFILEOUT
+  CPU::tracer.GTEoutRegCapture(2);
+#endif
+
 }
 
 u32* GetRegisterPtr(u32 index)
@@ -648,6 +653,7 @@ static void RTPS(const s16 V[3], u8 shift, bool lm, bool last)
   // IR1 = MAC1 = (TRX*1000h + RT11*VX0 + RT12*VY0 + RT13*VZ0) SAR (sf*12)
   // IR2 = MAC2 = (TRY*1000h + RT21*VX0 + RT22*VY0 + RT23*VZ0) SAR (sf*12)
   // IR3 = MAC3 = (TRZ*1000h + RT31*VX0 + RT32*VY0 + RT33*VZ0) SAR (sf*12)
+
   const s64 x = dot3(0);
   const s64 y = dot3(1);
   const s64 z = dot3(2);
@@ -798,7 +804,7 @@ static void Execute_RTPT(Instruction inst)
   const u8 shift = inst.GetShift();
   const bool lm = inst.lm;
 
-  RTPS(REGS.V0, shift, lm, false);
+  RTPS(REGS.V0, shift, lm, false);      
   RTPS(REGS.V1, shift, lm, false);
   RTPS(REGS.V2, shift, lm, true);
 
@@ -809,6 +815,13 @@ static void Execute_NCLIP(Instruction inst)
 {
   // MAC0 =   SX0*SY1 + SX1*SY2 + SX2*SY0 - SX0*SY2 - SX1*SY0 - SX2*SY1
   REGS.FLAG.Clear();
+
+  int test1 = s64(REGS.SXY0[0]) * s64(REGS.SXY1[1]);
+  int test2 = test1 + s64(REGS.SXY1[0]) * s64(REGS.SXY2[1]);
+  int test3 = test2 + s64(REGS.SXY2[0]) * s64(REGS.SXY0[1]);
+  int test4 = test3 - s64(REGS.SXY0[0]) * s64(REGS.SXY2[1]);
+  int test5 = test4 - s64(REGS.SXY1[0]) * s64(REGS.SXY0[1]);
+  int test6 = test5 - s64(REGS.SXY2[0]) * s64(REGS.SXY1[1]);
 
   TruncateAndSetMAC<0>(s64(REGS.SXY0[0]) * s64(REGS.SXY1[1]) + s64(REGS.SXY1[0]) * s64(REGS.SXY2[1]) +
                          s64(REGS.SXY2[0]) * s64(REGS.SXY0[1]) - s64(REGS.SXY0[0]) * s64(REGS.SXY2[1]) -
@@ -1153,6 +1166,15 @@ static void Execute_GPF(Instruction inst)
 
 void ExecuteInstruction(u32 inst_bits)
 {
+#ifdef GTEFILEOUT
+    CPU::tracer.GTEoutCommandCapture(inst_bits);
+#endif
+
+    if (inst_bits == 0x4a0ca030)
+    {
+        int a = 5;
+    }
+
   const Instruction inst{inst_bits};
   switch (inst.command)
   {
@@ -1253,6 +1275,11 @@ void ExecuteInstruction(u32 inst_bits)
       Panic("Missing handler");
       break;
   }
+
+#ifdef GTEFILEOUT
+  CPU::tracer.GTEoutRegCapture(3);
+#endif
+
 }
 
 InstructionImpl GetInstructionImpl(u32 inst_bits)

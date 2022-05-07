@@ -10,6 +10,19 @@
 
 class StateWrapper;
 
+#define NOMEMTIME
+//#define NOMEMREADTIME
+//#define FIXMEMTIME
+//#define FIXEDMEMTIME 3
+
+#define ACCURATETIMER
+
+//#define FASTCD 
+
+#define ENDLESSDMA
+
+//#define NOSPUIRQ
+
 namespace Bus {
 
 enum : u32
@@ -156,7 +169,8 @@ ALWAYS_INLINE TickCount GetDMARAMTickCount(u32 word_count)
   // 17 clks per 16 words, due to required row address loading, probably plus some further minimal overload due to
   // refresh cycles). This is making DMA much faster than CPU memory accesses (CPU DRAM access takes 1 opcode cycle
   // plus 6 waitstates, ie. 7 cycles in total).
-  return static_cast<TickCount>(word_count + ((word_count + 15) / 16));
+  //return static_cast<TickCount>(word_count + ((word_count + 15) / 16));
+  return static_cast<TickCount>(word_count);
 }
 
 enum class MemoryRegion

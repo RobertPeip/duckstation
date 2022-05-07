@@ -4,6 +4,7 @@
 #include "gpu.h"
 #include "interrupt_controller.h"
 #include "system.h"
+#include "bus.h"
 #ifdef WITH_IMGUI
 #include "imgui.h"
 #endif
@@ -210,8 +211,8 @@ u32 Timers::ReadRegister(u32 offset)
       if (timer_index < 2 && cs.external_counting_enabled)
       {
         // timers 0/1 depend on the GPU
-        if (timer_index == 0 || g_gpu->IsCRTCScanlinePending())
-          g_gpu->SynchronizeCRTC();
+        //if (timer_index == 0 || g_gpu->IsCRTCScanlinePending())
+        //  g_gpu->SynchronizeCRTC();
       }
 
       m_sysclk_event->InvokeEarly();
@@ -260,8 +261,8 @@ void Timers::WriteRegister(u32 offset, u32 value)
   if (timer_index < 2 && cs.external_counting_enabled)
   {
     // timers 0/1 depend on the GPU
-    if (timer_index == 0 || g_gpu->IsCRTCScanlinePending())
-      g_gpu->SynchronizeCRTC();
+    //if (timer_index == 0 || g_gpu->IsCRTCScanlinePending())
+    //  g_gpu->SynchronizeCRTC();
   }
 
   m_sysclk_event->InvokeEarly();
@@ -389,7 +390,12 @@ TickCount Timers::GetTicksUntilNextInterrupt() const
 
 void Timers::UpdateSysClkEvent()
 {
-  m_sysclk_event->Schedule(GetTicksUntilNextInterrupt());
+#ifdef ACCURATETIMER
+    TickCount nextevent = 1;
+#else
+    TickCount nextevent = GetTicksUntilNextInterrupt();
+#endif
+  m_sysclk_event->Schedule(nextevent);
 }
 
 void Timers::DrawDebugStateWindow()

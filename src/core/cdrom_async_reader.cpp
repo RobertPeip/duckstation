@@ -2,6 +2,7 @@
 #include "common/assert.h"
 #include "common/log.h"
 #include "common/timer.h"
+#include "cpu_core.h"
 Log_SetChannel(CDROMAsyncReader);
 
 CDROMAsyncReader::CDROMAsyncReader() = default;
@@ -150,6 +151,10 @@ void CDROMAsyncReader::DoSectorRead()
   }
 
   const CDImage::LBA pos = m_media->GetPositionOnDisc();
+  if (pos == 0xB4)
+  {
+      int a = 5;
+  }
   if (!m_media->ReadRawSector(m_sector_buffer.data(), &m_subq))
   {
     m_sector_read_result.store(false);
@@ -159,6 +164,8 @@ void CDROMAsyncReader::DoSectorRead()
 
   m_last_read_sector = pos;
   m_sector_read_result.store(true);
+
+  CPU::tracer.CDOutCapture(12, 0, pos);
 
   const double read_time = timer.GetTimeMilliseconds();
   if (read_time > 1.0f)

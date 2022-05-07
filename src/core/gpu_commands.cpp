@@ -25,16 +25,29 @@ static constexpr u32 ReplaceZero(u32 value, u32 value_for_zero)
 void GPU::ExecuteCommands()
 {
   m_syncing = true;
+  if (m_pending_command_ticks < 0) m_pending_command_ticks = 0;
+  TickCount m_pending_command_ticks_start = m_pending_command_ticks;
+
+  //if (dmaGPUTicks >= m_command_tick_event->m_downcount)
+  //{
+  //    CommandTickEvent(dmaGPUTicks);
+  //    dmaGPUTicks = 0;
+  //    m_command_tick_event->m_downcount = 0;
+  //}
 
   for (;;)
   {
-    if (m_pending_command_ticks <= m_max_run_ahead && !m_fifo.IsEmpty())
+    if ((m_pending_command_ticks - dmaGPUTicks) <= m_max_run_ahead && !m_fifo.IsEmpty())
     {
       switch (m_blitter_state)
       {
         case BlitterState::Idle:
         {
           const u32 command = FifoPeek(0) >> 24;
+          if (command == 0x02)
+          {
+              int a = 5;
+          }
           if ((this->*s_GP0_command_handler_table[command])())
             continue;
           else
@@ -110,6 +123,12 @@ void GPU::ExecuteCommands()
 
   UpdateGPUIdle();
   m_syncing = false;
+
+  if (m_pending_command_ticks_start < m_pending_command_ticks)
+  {
+      if (m_pending_command_ticks >= 0) m_pending_command_ticks_last = m_pending_command_ticks;
+      else m_pending_command_ticks_last = 0;
+  }
 }
 
 void GPU::EndCommand()
@@ -196,7 +215,7 @@ bool GPU::HandleClearCacheCommand()
 {
   Log_DebugPrintf("GP0 clear cache");
   m_fifo.RemoveOne();
-  AddCommandTicks(1);
+  //AddCommandTicks(1);
   EndCommand();
   return true;
 }
@@ -211,7 +230,7 @@ bool GPU::HandleInterruptRequestCommand()
   }
 
   m_fifo.RemoveOne();
-  AddCommandTicks(1);
+  //AddCommandTicks(1);
   EndCommand();
   return true;
 }
@@ -221,7 +240,7 @@ bool GPU::HandleSetDrawModeCommand()
   const u32 param = FifoPop() & 0x00FFFFFFu;
   Log_DebugPrintf("Set draw mode %08X", param);
   SetDrawMode(Truncate16(param));
-  AddCommandTicks(1);
+  //AddCommandTicks(1);
   EndCommand();
   return true;
 }
@@ -230,7 +249,7 @@ bool GPU::HandleSetTextureWindowCommand()
 {
   const u32 param = FifoPop() & 0x00FFFFFFu;
   SetTextureWindow(param);
-  AddCommandTicks(1);
+  //AddCommandTicks(1);
   EndCommand();
   return true;
 }
@@ -250,7 +269,7 @@ bool GPU::HandleSetDrawingAreaTopLeftCommand()
     m_drawing_area_changed = true;
   }
 
-  AddCommandTicks(1);
+  //AddCommandTicks(1);
   EndCommand();
   return true;
 }
@@ -271,7 +290,7 @@ bool GPU::HandleSetDrawingAreaBottomRightCommand()
     m_drawing_area_changed = true;
   }
 
-  AddCommandTicks(1);
+  //AddCommandTicks(1);
   EndCommand();
   return true;
 }
@@ -290,7 +309,7 @@ bool GPU::HandleSetDrawingOffsetCommand()
     m_drawing_offset.y = y;
   }
 
-  AddCommandTicks(1);
+  //AddCommandTicks(1);
   EndCommand();
   return true;
 }
@@ -309,7 +328,7 @@ bool GPU::HandleSetMaskBitCommand()
   Log_DebugPrintf("Set mask bit %u %u", BoolToUInt32(m_GPUSTAT.set_mask_while_drawing),
                   BoolToUInt32(m_GPUSTAT.check_mask_before_draw));
 
-  AddCommandTicks(1);
+  //AddCommandTicks(1);
   EndCommand();
   return true;
 }
@@ -333,12 +352,6 @@ bool GPU::HandleRenderPolygonCommand()
     s_setup_time[BoolToUInt8(rc.quad_polygon)][BoolToUInt8(rc.shading_enable)][BoolToUInt8(rc.texture_enable)]));
   AddCommandTicks(setup_ticks);
 
-  Log_TracePrintf("Render %s %s %s %s polygon (%u verts, %u words per vert), %d setup ticks",
-                  rc.quad_polygon ? "four-point" : "three-point",
-                  rc.transparency_enable ? "semi-transparent" : "opaque",
-                  rc.texture_enable ? "textured" : "non-textured", rc.shading_enable ? "shaded" : "monochrome",
-                  ZeroExtend32(num_vertices), ZeroExtend32(words_per_vertex), setup_ticks);
-
   // set draw state up
   if (rc.texture_enable)
   {
@@ -353,6 +366,8 @@ bool GPU::HandleRenderPolygonCommand()
   m_render_command.bits = rc.bits;
   m_fifo.RemoveOne();
 
+  //if (m_stats.num_polygons > 2) return true;
+  
   DispatchRenderCommand();
   EndCommand();
   return true;
@@ -465,7 +480,7 @@ bool GPU::HandleFillRectangleCommand()
     FillVRAM(dst_x, dst_y, width, height, color);
 
   m_stats.num_vram_fills++;
-  AddCommandTicks(46 + ((width / 8) + 9) * height);
+  AddCommandTicks(46 + width * height);
   EndCommand();
   return true;
 }
